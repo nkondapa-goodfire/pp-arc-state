@@ -90,6 +90,7 @@ def merge_group(
 
     merged = anndata.concat(adatas, join="outer")
     merged.obs_names_make_unique()
+    merged.obsm["X_hvg"] = merged.X.toarray()
     return merged
 
 

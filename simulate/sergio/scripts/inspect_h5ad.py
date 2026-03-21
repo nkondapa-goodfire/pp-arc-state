@@ -66,12 +66,20 @@ def plot_obs_distributions(ad: anndata.AnnData, out_path: str) -> None:
     if len(cols) == 1:
         axes = [axes]
 
+    MAX_BARS = 20
     for ax, col in zip(axes, cols):
-        counts = ad.obs[col].value_counts().sort_index()
+        counts = ad.obs[col].value_counts()
+        if len(counts) > MAX_BARS:
+            top = counts.iloc[:MAX_BARS]
+            other = counts.iloc[MAX_BARS:].sum()
+            import pandas as pd
+            counts = pd.concat([top, pd.Series({"other (N=%d)" % (len(counts) - MAX_BARS): other})])
+        else:
+            counts = counts.sort_index()
         ax.bar(range(len(counts)), counts.values, color="#4A90D9", alpha=0.85, edgecolor="white")
         ax.set_xticks(range(len(counts)))
         ax.set_xticklabels(counts.index, rotation=45, ha="right", fontsize=7)
-        ax.set_title(f"obs['{col}']")
+        ax.set_title(f"obs['{col}'] ({ad.obs[col].nunique()} unique)")
         ax.set_ylabel("Cell count")
         ax.grid(True, alpha=0.25, axis="y")
 
@@ -156,22 +164,48 @@ def plot_pert_effect(X_ctrl: np.ndarray, X_pert: np.ndarray,
     pert_mean = X_pert.mean(axis=0)
     log2fc = np.log2((pert_mean + 1e-6) / (ctrl_mean + 1e-6))
 
-    n_genes = len(ctrl_mean)
-    gene_idx = np.arange(n_genes)
+    # Parse pert gene index from name e.g. "SYN_0033_KO" -> 33
+    pert_gene_idx = None
+    parts = pert_gene_name.split("_")
+    if len(parts) >= 2 and parts[0] == "SYN":
+        try:
+            pert_gene_idx = int(parts[1])
+        except ValueError:
+            pass
+
+    # Filter to genes with any expression signal to avoid empty plot
+    has_signal = (ctrl_mean > 1e-4) | (pert_mean > 1e-4)
+    sig_idx = np.where(has_signal)[0]
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     ax = axes[0]
-    colors = ["#E74C3C" if v < 0 else "#27AE60" for v in log2fc]
-    ax.bar(gene_idx, log2fc, color=colors, alpha=0.8, width=0.8)
+    if len(sig_idx) > 0:
+        fc_sig = log2fc[sig_idx]
+        colors = ["orange" if (pert_gene_idx is not None and i == pert_gene_idx)
+                  else ("#E74C3C" if v < 0 else "#27AE60")
+                  for i, v in zip(sig_idx, fc_sig)]
+        ax.bar(range(len(sig_idx)), fc_sig, color=colors, alpha=0.8, width=0.8)
+        ax.set_xticks([])
+        if pert_gene_idx is not None and pert_gene_idx in sig_idx:
+            pos = np.where(sig_idx == pert_gene_idx)[0][0]
+            ax.annotate(f"gene {pert_gene_idx}", xy=(pos, fc_sig[pos]),
+                        xytext=(pos, fc_sig[pos] + 0.3 * np.sign(fc_sig[pos] or 1)),
+                        fontsize=7, ha="center", color="orange")
+    else:
+        ax.text(0.5, 0.5, "no expressed genes", transform=ax.transAxes,
+                ha="center", va="center", color="gray")
     ax.axhline(0, color="black", lw=0.8)
-    ax.set_xlabel("Gene index")
+    ax.set_xlabel(f"Expressed genes ({len(sig_idx)}/{len(ctrl_mean)} with signal)")
     ax.set_ylabel("log2FC (pert / ctrl)")
     ax.set_title(f"Per-gene log2FC  [{pert_gene_name}]")
     ax.grid(True, alpha=0.3, axis="y")
 
     ax2 = axes[1]
     ax2.scatter(ctrl_mean, pert_mean, s=10, alpha=0.5, color="#4A90D9")
+    if pert_gene_idx is not None and pert_gene_idx < len(ctrl_mean):
+        ax2.scatter(ctrl_mean[pert_gene_idx], pert_mean[pert_gene_idx],
+                    s=80, color="orange", zorder=5, label=f"pert gene ({pert_gene_idx})")
     lim = max(ctrl_mean.max(), pert_mean.max()) * 1.05
     ax2.plot([0, lim], [0, lim], "k--", lw=0.8, alpha=0.5, label="y=x")
     ax2.set_xlabel("Control mean expression")
