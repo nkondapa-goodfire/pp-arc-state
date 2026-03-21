@@ -16,5 +16,8 @@ test_outputs/
 # SERGIO vendored sample datasets
 SERGIO/data_sets/
 
+# Large binary artifacts
+configs/pert_onehot_map.pt
+
 # macOS
 .DS_Store
