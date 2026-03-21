@@ -1,0 +1,13 @@
+[datasets]
+sergio_mini = "/mnt/polished-lake/home/nkondapaneni/state/simulate/sergio/data/sergio_synthetic/mini_merged"
+
+# NOTE: mini_merged does not exist yet — regenerate with:
+#   sbatch submit_generate_dataset_mini.sh
+#   uv run python scripts/build_merged_h5ads.py --src data/sergio_synthetic/mini --dst data/sergio_synthetic/mini_merged
+
+[training]
+sergio_mini = "train"
+
+# Hold out bin_4 across all instances for validation
+[zeroshot]
+"sergio_mini.bin_4" = "val"

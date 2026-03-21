@@ -4,193 +4,404 @@
 
 Train the State Transition (ST) model from scratch on SERGIO-generated synthetic scRNA-seq data using the `X_hvg` input path (log-normalized expression counts, no PLM). Evaluate on a fixed synthetic test set. The goal is to establish that State learns meaningful perturbation structure from synthetic data and identify the best training configuration to use as an initializer before real-data fine-tuning.
 
-**Scope of this plan:** Build the data pipeline, format synthetic data for State, run baseline training, and sweep key hyperparameters. REPTILE meta-learning is deferred to a follow-on plan.
+---
+
+## 1. Fixed Gene Pool1
+
+Define a vocabulary of 2000 synthetic gene names, fixed for the lifetime of this project:
+
+```
+SYN_0000, SYN_0001, ..., SYN_1999
+```
+
+Each GRN instance draws a subset of **~200 genes** from this pool (see Section 5 for sampling strategy). Genes not selected for a given GRN instance have zero expression for all cells in that instance. `X_hvg` is always `(n_cells, 2000)` across all GRN instances — consistent dimensionality, no alignment needed.
+
+**Why 200 genes per GRN**: SERGIO is well-validated at this scale (the original paper benchmarks down to 100-gene GRNs). It keeps simulation fast enough to generate many instances while still producing clear multi-hop perturbation cascades from master regulators.
+
+**Why the 2000-gene pool**: State's real training data (e.g., Replogle-Nadig) has all cells measuring the same fixed gene panel, with `preprocess_train` producing a consistent `X_hvg` shape across the full dataset. The fixed pool replicates this. Using 2000 matches the standard HVG count used for Replogle, so `basal_encoder` weights transfer directly at fine-tuning time.
+
+**HVG selection**: **Skip** — do not run `sc.pp.highly_variable_genes`. With 200 active genes per GRN and 1800 zeros, variance across the dataset is dominated by gene presence/absence rather than biological signal, making HVG selection unreliable. Use all 2000 dimensions directly as `X_hvg`.
+
+**Sparsity**: Each cell vector is ~90% zeros. This is normal for scRNA-seq (high dropout) and does not require special handling.
 
 ---
 
-## 1. Input Format: What State Expects
+## 2. Gene Sampling Strategy
 
-State ST with `embed_key=X_hvg` takes:
+Each GRN instance samples its 200 active genes from the 2000-gene pool. The strategy is a configurable flag, defaulting to `random_draw`.
 
+```python
+def sample_grn_genes(pool_size: int, grn_size: int, seed: int, strategy: str = "random_draw") -> list[int]:
+    """Return indices into the global gene pool for this GRN instance."""
+    rng = np.random.default_rng(seed)
+    if strategy == "random_draw":
+        return sorted(rng.choice(pool_size, size=grn_size, replace=False).tolist())
+    # Additional strategies can be added here (e.g., "fixed_blocks", "overlap_core")
+    raise ValueError(f"Unknown gene sampling strategy: {strategy}")
 ```
-.obsm["X_hvg"]    float32  (n_cells, n_hvgs)   — log-normalized HVG expression
-.obs["gene"]      str                           — perturbation name; "non-targeting" for control
-.obs["cell_type"] str                           — cell type / bin label
-.obs["gem_group"] str                           — batch label (can be a constant like "synthetic")
-```
 
-The preprocessing pipeline (`state tx preprocess_train`) does:
-1. `sc.pp.normalize_total(adata)` — library-size normalize to 10k counts
-2. `sc.pp.log1p(adata)` — log1p transform
-3. `sc.pp.highly_variable_genes(adata, n_top_genes=N)` — select HVGs
-4. `adata.obsm["X_hvg"] = adata[:, adata.var.highly_variable].X.toarray()`
-
-For synthetic data we run this pipeline on each GRN instance individually (HVG selection makes sense per-GRN since gene count is fixed) or skip HVG selection and use all genes (if n_genes is small enough, e.g. ≤ 400).
-
-**Perturbation encoding**: `pert_rep: onehot` (default) — one-hot over unique perturbation names within a dataset. Since each GRN instance has its own synthetic gene names, we use *positional* perturbation names: `"gene_0_KO"`, `"gene_1_KO"`, ..., `"gene_{k}_KO"` where k is the index of the perturbed gene within the GRN. This makes the encoding consistent across GRN instances.
+The sampled indices are stored in `adata.uns["grn_gene_indices"]` for reproducibility.
 
 ---
 
-## 2. SERGIO Data Generation Pipeline
+## 3. GRN Topology Types
 
-### 2.1 Per-GRN instance
-
-```python
-# Pseudocode — implement in scripts/generate_sergio_dataset.py
-for grn_seed in range(N_GRN_INSTANCES):
-    # 1. Generate scale-free GRN
-    grn = generate_scale_free_grn(n_genes=N_GENES, m=M, seed=grn_seed)
-
-    # 2. Simulate control cells
-    sim = sergio(number_genes=N_GENES, number_bins=N_BINS, number_sc=N_SC,
-                 noise_params=NOISE_PARAMS, ...)
-    sim.build_graph(targets, regs)
-    sim.simulate()
-    control_expr = sim.getExpressions()   # (n_bins, n_genes, n_sc)
-
-    # 3. For each master regulator to perturb:
-    for gene_idx, gene_name in enumerate(master_regulators[:K_PERTS]):
-        sim_p = sergio(...)
-        sim_p.build_graph(targets, regs)
-        apply_ko_perturbation(sim_p.graph_, gene_idx)
-        sim_p.simulate()
-        pert_expr = sim_p.getExpressions()   # (n_bins, n_genes, n_sc)
-
-        # 4. Build AnnData and save as h5ad
-        adata = build_anndata(
-            control_expr=control_expr,
-            pert_expr=pert_expr,
-            pert_name=f"gene_{gene_idx}_KO",
-            n_bins=N_BINS,
-            grn_seed=grn_seed,
-        )
-        adata.write_h5ad(f"output/grn_{grn_seed}/gene_{gene_idx}_KO.h5ad")
-```
-
-### 2.2 AnnData construction
-
-Each H5AD contains **both** control and perturbed cells for one (GRN instance, perturbation) pair:
-
-```
-adata.X               — raw SERGIO expression (n_cells, n_genes), float32
-adata.obs["gene"]     — "non-targeting" for control cells, "gene_{k}_KO" for perturbed
-adata.obs["cell_type"]— "bin_0", "bin_1", ..., "bin_{n_bins-1}"
-adata.obs["gem_group"]— "grn_{seed}" (serves as batch identifier)
-adata.var.index       — "gene_0", "gene_1", ..., "gene_{n_genes-1}"
-```
-
-After construction, run preprocessing in-place:
+**SERGIO requires a DAG.** SERGIO processes genes in topological order (master regulators first, then downstream layers). Cycles make topological ordering impossible and will break simulation. Both ER and BA graphs can contain cycles and must be converted to DAGs before use.
 
 ```python
-sc.pp.normalize_total(adata)
-sc.pp.log1p(adata)
-# For small n_genes: skip HVG selection, use all genes as HVGs
-adata.obsm["X_hvg"] = adata.X.toarray() if sparse else adata.X
-# For larger n_genes: standard HVG selection
-# sc.pp.highly_variable_genes(adata, n_top_genes=min(N_GENES, 400))
-# adata.obsm["X_hvg"] = adata[:, adata.var.highly_variable].X.toarray()
-adata.write_h5ad(output_path)
+def enforce_dag(G: nx.DiGraph, seed: int) -> nx.DiGraph:
+    """Keep only edges consistent with a random topological ordering."""
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(list(G.nodes())).tolist()
+    rank = {node: i for i, node in enumerate(order)}
+    dag = nx.DiGraph()
+    dag.add_nodes_from(G.nodes())
+    dag.add_edges_from((u, v) for u, v in G.edges() if rank[u] < rank[v])
+    return dag
 ```
 
-### 2.3 KO perturbation implementation
+This drops ~50% of edges on average, so target `p_edge` and `m` should be set at **2× the desired post-DAG density**.
 
-SERGIO has no built-in perturbation API. Modify `sim.graph_` after `build_graph` but before `simulate`:
+### 3.1 Erdős–Rényi (ER) — true random graph
+
+Each directed edge is included independently with probability `p`, then `enforce_dag` is applied. Degree distribution is binomial, no hubs.
 
 ```python
-def apply_ko_perturbation(graph, gene_idx):
-    """Knockout: set basal rate to 0 for master regulators,
-    remove gene from regulation params of downstream targets."""
-    gene_name = list(graph.keys())[gene_idx]
-    # Zero basal rates (master regulators)
-    if 'rates' in graph[gene_name]:
-        graph[gene_name]['rates'] = [0.0] * len(graph[gene_name]['rates'])
-    # Remove this gene as a regulator in all targets
-    for other_gene, info in graph.items():
-        if 'params' in info:
-            info['params'] = [p for p in info['params'] if p['reg'] != gene_name]
+def generate_er_grn(n_genes: int, p_edge: float, seed: int) -> nx.DiGraph:
+    G = nx.erdos_renyi_graph(n_genes, p_edge, seed=seed, directed=True)
+    G.remove_edges_from(nx.selfloop_edges(G))
+    return enforce_dag(G, seed)
 ```
 
-### 2.4 Output directory structure
+Target post-DAG mean in-degree of 2–4; set `p_edge ≈ 0.02–0.04` (2× to account for DAG pruning).
+
+### 3.2 Barabási–Albert (BA) — power-law degree distribution
+
+Preferential attachment produces hub regulators with many targets — biologically more realistic. BA node construction order (0, 1, ..., n-1) is used as the natural topological ordering — orient all edges from lower to higher index, which avoids most cycle removal and preserves the power-law structure.
+
+```python
+def generate_ba_grn(n_genes: int, m: int, seed: int) -> nx.DiGraph:
+    G = nx.barabasi_albert_graph(n_genes, m, seed=seed)
+    DG = nx.DiGraph()
+    for u, v in G.edges():
+        # Orient by construction order: lower index = earlier node = regulator
+        if u < v:
+            DG.add_edge(u, v)
+        else:
+            DG.add_edge(v, u)
+    return DG  # already a DAG by construction
+```
+
+`m=2` by default (2 edges added per new node). No DAG pruning needed for BA since construction order is acyclic.
+
+### 3.3 Barabási–Albert Variable-m (BA-VM) — sparse heterogeneous in-degree
+
+A variant of BA where each new node draws its number of regulators `m` from `{1, 2, 3}` according to a geometric distribution (p=0.5) truncated and renormalized:
+
+| m | probability |
+|---|-------------|
+| 1 | ~57%        |
+| 2 | ~29%        |
+| 3 | ~14%        |
+
+This produces a sparser, more heterogeneous network than fixed-m BA: mean in-degree ≈ 1.57 vs 2.0, with ~56% of genes receiving only a single regulator. Preferential attachment is preserved — edges are still drawn proportional to existing out-degree, so a hub structure still emerges. Edges are oriented lower → higher index as in BA.
+
+```python
+def generate_ba_vm_grn(n_genes, m_weights=(0.57, 0.29, 0.14), seed=None):
+    # seed graph: 3 nodes fully connected
+    # for each new node: sample m ~ Categorical(m_weights), attach to m
+    # existing nodes via preferential attachment (∝ out-degree + 1)
+    # orient all edges lower-index → higher-index
+```
+
+Compared to fixed-m BA at simulation time:
+- Lower mean expression (~1.0–1.2 vs ~1.5) due to weaker aggregate regulatory input
+- Higher baseline CV (~0.4–0.6 vs ~0.2–0.3) — sparser regulation creates more heterogeneous expression across cell types
+- Slightly higher sparsity at all noise levels — genes with only 1 regulator are more easily driven to zero by the SDE noise floor
+
+### 3.4 Metadata tracking
+
+```python
+adata.uns["grn_type"] = "ER" | "BA" | "BA-VM"
+adata.uns["grn_seed"] = <int>
+adata.uns["grn_params"] = {"p_edge": 0.015} | {"m": 2} | {"m_weights": [0.57, 0.29, 0.14]}
+adata.uns["grn_gene_indices"] = [42, 107, 883, ...]  # indices into the 2000-gene pool
+adata.uns["grn_n_levels"] = nx.dag_longest_path_length(dag) + 1  # depth of the DAG
+adata.uns["grn_n_edges"] = dag.number_of_edges()
+```
+
+`grn_n_levels` enables post-hoc analysis of whether perturbation signal strength correlates with GRN depth — shallow graphs (2–3 levels) have few downstream cascade targets while deeper graphs produce richer effects.
+
+---
+
+## 4. H5AD Schema
+
+```
+adata.X                       float32  (n_cells, 2000)   raw SERGIO expression (zeros for inactive genes)
+adata.obsm["X_hvg"]           float32  (n_cells, 2000)   log-normalized expression (all 2000 dims, no HVG selection)
+adata.obs["gene"]             str      "non-targeting" | "SYN_{k:04d}_KO" | "SYN_{k:04d}_KD"  (k = index in global pool)
+adata.obs["cell_type"]        str      "bin_0" ... "bin_{n_bins-1}"
+adata.obs["gem_group"]        str      "grn_{seed:04d}"
+adata.obs["ko_out_degree"]    int      out-degree of KO gene in the GRN (-1 for non-targeting cells)
+adata.var.index               str      "SYN_0000" ... "SYN_1999"  (always full 2000-gene pool)
+adata.uns["grn_type"]         str      "ER" | "BA"
+adata.uns["grn_seed"]         int
+adata.uns["grn_params"]       dict
+adata.uns["grn_gene_indices"] list[int]
+```
+
+Preprocessing (applied in-place before saving):
+
+```python
+sc.pp.normalize_total(adata)                       # library-size normalize to 10k
+sc.pp.log1p(adata)                                 # log1p transform
+adata.obsm["X_hvg"] = adata.X.toarray()           # all 2000 genes, no HVG selection
+```
+
+---
+
+## 5. Training Dataset
+
+### 5.1 Ablation grid
+
+The training dataset is organized along three orthogonal axes so any subset can be isolated for ablation without regenerating data:
+
+| Axis             | Values                                                         |
+|------------------|----------------------------------------------------------------|
+| Graph type       | `ER`, `BA`, `BA-VM`                                           |
+| GRN size         | `10`, `50`, `100`, `200`, genes (ER capped at `100`)    |
+| Noise level      | `none` (0.0), `low` (0.1), `high` (0.5)                      |
+| Perturbation type | `KO`, `KD_010`, `KD_050`, `KD_080`, `KO+KD` (all four)      |
+
+KD strengths encode the fraction of gene silencing applied to basal rate and regulatory edge weights:
+
+| Label     | `pert_emb[k]` | Description              |
+|-----------|---------------|--------------------------|
+| `KO`      | 1.0           | Full knockout            |
+| `KD_010`  | 0.1           | 10% knockdown            |
+| `KD_050`  | 0.5           | 50% knockdown            |
+| `KD_080`  | 0.8           | 80% knockdown            |
+
+**100 seeds per cell** × 3 types × 5 sizes × 3 noise levels = **4500 GRN instances** total.
+Each instance generates **10 perturbations** (top-K by out-degree) × **4 perturbation types** = 40 h5ad files per instance, ~156k files total.
+
+### 5.2 Directory structure
 
 ```
 data/sergio_synthetic/
   train/
-    grn_0000/
-      gene_0_KO.h5ad     # control + gene_0_KO cells
-      gene_1_KO.h5ad
-      ...
-    grn_0001/
-      ...
+    {grn_type}/          # ER | BA | BA_VM
+      size_{n}/          # size_010 | size_050 | size_100 | size_200 | size_400
+        noise_{level}/   # noise_000 | noise_010 | noise_050
+          grn_{seed:04d}/
+            SYN_{k:04d}_KO.h5ad
+            SYN_{k:04d}_KD_010.h5ad
+            SYN_{k:04d}_KD_050.h5ad
+            SYN_{k:04d}_KD_080.h5ad
+            ...
   test/
-    grn_5000/            # seeds disjoint from train
-      gene_0_KO.h5ad
-      ...
+    (same structure, seeds 5000–5099, disjoint from train)
+  manifest.csv           # one row per h5ad: path + all group attributes
 ```
 
-Each file contains ~`N_BINS × N_SC × 2` cells (control + perturbed), e.g. 9 bins × 200 cells × 2 = 3,600 cells per file.
+`manifest.csv` columns: `path, grn_type, grn_size, noise_level, grn_seed, pert_gene, pert_type, pert_strength, pert_out_degree`
+
+### 5.3 Ablation subsets
+
+Any ablation is defined by filtering `manifest.csv` and passing the resulting paths to the dataloader. Example subsets:
+
+| Ablation                        | Filter                                                      |
+|---------------------------------|-------------------------------------------------------------|
+| Graph type (ER only)            | `grn_type == "ER"`                                          |
+| Size sweep                      | `grn_type == "BA" & noise_level == "low"`                   |
+| Noise sweep                     | `grn_type == "BA" & grn_size == 200`                        |
+| KO only                         | `pert_type == "KO"`                                         |
+| KD only (all strengths)         | `pert_type.str.startswith("KD")`                            |
+| KD strength sweep               | `pert_type in ["KD_010", "KD_050", "KD_080"]`               |
+| KO + strong KD                  | `pert_type in ["KO", "KD_080"]`                             |
+| KO + all KD                     | `pert_type in ["KO", "KD_010", "KD_050", "KD_080"]`         |
+| Baseline (full)                 | no filter                                                   |
+
+The TOML config references a pre-filtered manifest rather than a directory, so switching ablations requires only swapping the manifest path.
 
 ---
 
-## 3. SLURM Generation Job
+## 6. Perturbation Encoding
 
-Generation is CPU-bound and embarrassingly parallel. Use a SLURM array:
+Use a **gene-position magnitude vector** keyed to the global 2000-gene pool:
+
+```
+pert_emb ∈ [0, 1]^2000
+pert_emb[k] = perturbation strength at gene k  (0 = no effect, 1 = full KO)
+```
+
+Perturbation strength by type:
+
+| Type           | `pert_emb[k]` | `obs["gene"]`         |
+|----------------|---------------|-----------------------|
+| Non-targeting  | 0.0           | `"non-targeting"`     |
+| Knockout (KO)  | 1.0           | `"SYN_{k:04d}_KO"`   |
+| Knockdown (KD) | 0.5           | `"SYN_{k:04d}_KD"`   |
+
+KO and KD of the same gene share position k — the magnitude encodes perturbation strength. The `pert_encoder` MLP receives float32 input so continuous values are natively supported; no architecture changes are needed. This allows the model to learn that larger values at position k correspond to stronger perturbation of gene k, and to interpolate between KD and KO.
+
+Build a fixed `pert_onehot_map` once before any training run:
+
+```python
+pert_onehot_map = {"non-targeting": np.zeros(2000, dtype=np.float32)}
+for k in range(2000):
+    for label, strength in [("KO", 1.0), ("KD_010", 0.1), ("KD_050", 0.5), ("KD_080", 0.8)]:
+        v = np.zeros(2000, dtype=np.float32)
+        v[k] = strength
+        pert_onehot_map[f"SYN_{k:04d}_{label}"] = v
+
+torch.save(pert_onehot_map, "configs/pert_onehot_map.pt")
+```
+
+`pert_dim = 2000` in the model config. Size is fixed regardless of how many GRN instances are in the training set.
+
+---
+
+## 6. Data Generation Pipeline
+
+### 6.1 Per-GRN instance
+
+```python
+# scripts/generate_sergio_dataset.py
+POOL_SIZE = 2000
+GRN_NAMES = [f"SYN_{i:04d}" for i in range(POOL_SIZE)]
+
+def generate_instance(grn_seed, grn_type, grn_size, output_dir, params,
+                      gene_strategy="random_draw"):
+    # 1. Sample active genes from pool
+    gene_indices = sample_grn_genes(POOL_SIZE, grn_size, grn_seed, gene_strategy)
+    active_gene_names = [GRN_NAMES[i] for i in gene_indices]
+
+    # 2. Generate GRN topology over the active genes
+    if grn_type == "ER":
+        G = generate_er_grn(grn_size, p_edge=params["p_edge"], seed=grn_seed)
+    elif grn_type == "BA":
+        G = generate_ba_grn(grn_size, m=params["m"], seed=grn_seed)
+    elif grn_type == "BA-VM":
+        G = generate_ba_vm_grn(grn_size, m_weights=params["m_weights"], seed=grn_seed)
+
+    targets, regs = grn_to_sergio_format(G, active_gene_names)
+    # Use top-K by out-degree (robust across all graph types)
+    top_regs = sorted(G.nodes(), key=lambda n: G.out_degree(n), reverse=True)[:K_PERTS]
+
+    # 3. Simulate control
+    sim_ctrl = sergio(number_genes=grn_size, number_bins=N_BINS, number_sc=N_SC, ...)
+    sim_ctrl.build_graph(targets, regs)
+    sim_ctrl.simulate()
+    ctrl_expr = sim_ctrl.getExpressions()   # (N_BINS, grn_size, N_SC)
+
+    # 4. Simulate KO and KD for each selected gene
+    for local_idx in top_regs:
+        global_idx = gene_indices[local_idx]   # index in the 2000-gene pool
+
+        for pert_type, strength in [("KO", 1.0), ("KD", 0.5)]:
+            sim_p = sergio(number_genes=grn_size, number_bins=N_BINS, number_sc=N_SC, ...)
+            sim_p.build_graph(targets, regs)
+            apply_perturbation(sim_p.graph_, local_idx, strength)  # scales basal/edges by (1 - strength)
+            sim_p.simulate()
+            pert_expr = sim_p.getExpressions()
+
+            # 5. Embed into 2000-gene space and write h5ad
+            adata = build_anndata_embedded(
+                ctrl_expr, pert_expr,
+                global_gene_idx=global_idx,
+                pert_type=pert_type,
+                gene_indices=gene_indices,
+                all_gene_names=GRN_NAMES,
+                grn_seed=grn_seed, grn_type=grn_type, grn_params=params,
+            )
+            preprocess(adata)
+            adata.write_h5ad(f"{output_dir}/grn_{grn_seed:04d}/SYN_{global_idx:04d}_{pert_type}.h5ad")
+```
+
+`build_anndata_embedded` places SERGIO expression values at the active gene columns and leaves the other 1800 columns as zero.
+
+### 6.2 Perturbation selection
+
+Use **top-K by out-degree** for both ER and BA graphs. This is robust — ER graphs may have few or no nodes with in-degree 0, but every graph has high-out-degree nodes. K=10 by default.
+
+Each KO perturbation's out-degree is stored in `adata.obs["ko_out_degree"]` (set to -1 for non-targeting cells). This enables post-hoc analysis of whether model prediction quality correlates with KO gene influence — hub KOs (high out-degree) produce strong cascades while low-degree KOs have minimal effect. Useful diagnostic for understanding what the model has actually learned before fine-tuning on real data.
+
+### 6.3 Directory structure
+
+```
+data/sergio_synthetic/
+  train/
+    ER/
+      grn_0000/
+        SYN_0042_KO.h5ad   # control + KO cells, 2000-gene vectors
+        SYN_0107_KO.h5ad
+        ...
+      grn_0001/ ...
+    BA/
+      grn_1000/ ...
+  test/
+    ER/  grn_5000/ ...
+    BA/  grn_5500/ ...
+```
+
+### 6.4 SLURM array job
 
 ```bash
-# scripts/submit_generate.sh
-sbatch --array=0-499 --cpus-per-task=4 --mem=8G \
+# ER graphs (seeds 0–499)
+sbatch --array=0-499 --cpus-per-task=4 \
   --wrap="python scripts/generate_sergio_dataset.py \
     --grn-seed \$SLURM_ARRAY_TASK_ID \
-    --n-genes 400 \
-    --n-bins 9 \
-    --n-sc 200 \
-    --k-perts 20 \
-    --output-dir data/sergio_synthetic/train \
-    --noise-params dpd_low"
-```
+    --grn-type ER --p-edge 0.015 \
+    --pool-size 2000 --grn-size 200 \
+    --n-bins 9 --n-sc 200 --k-perts 10 \
+    --gene-strategy random_draw \
+    --output-dir data/sergio_synthetic/train/ER"
 
-Estimated time: ~3 min per GRN instance (400 genes, 20 perturbations) × 500 instances = ~25 CPU-hours total.
-
----
-
-## 4. Fixed Test Set (generate once, never modify)
-
-- 40 GRN instances (seeds 5000–5039), disjoint from training
-- Stratified: {100 genes, 400 genes} × {no noise, dpd_low noise} = 4 sub-groups × 10 instances each
-- 9 cell types, 200 cells/type, 20 KO perturbations per GRN (master regulators)
-- Hold-out split: 2 of 9 cell types withheld entirely from training within each test GRN
-
-Generate and preprocess once:
-
-```bash
-python scripts/generate_sergio_dataset.py \
-  --grn-seed-range 5000 5040 \
-  --output-dir data/sergio_synthetic/test \
-  --stratified
+# BA graphs (seeds 1000–1499)
+sbatch --array=1000-1499 --cpus-per-task=4 \
+  --wrap="python scripts/generate_sergio_dataset.py \
+    --grn-seed \$SLURM_ARRAY_TASK_ID \
+    --grn-type BA --m 2 \
+    --pool-size 2000 --grn-size 200 \
+    --n-bins 9 --n-sc 200 --k-perts 10 \
+    --gene-strategy random_draw \
+    --output-dir data/sergio_synthetic/train/BA"
 ```
 
 ---
 
-## 5. TOML Configuration for State Training
+## 7. Fixed Test Set
 
-State's data module reads a TOML that maps dataset names to directories of h5ad files.
+- Seeds 5000–5099 (100 instances total), disjoint from training
+- Stratified: **ER** (34 instances) × **BA** (33 instances) × **BA-VM** (33 instances)
+- **n_bins sampled from {3, 5, 8}** — each GRN instance is assigned one bin count at generation time, balanced across the 100 seeds
+- 200 cells/bin, 10 perturbations per GRN (KO + KD_010 + KD_050 + KD_080)
+- For each GRN, the **last bin** is withheld as a held-out cell type (bin index `n_bins - 1`), fixed at generation time
+- Preprocessed and stored at generation time; never modified
+
+Metrics computed:
+
+- Overall (all 100 GRNs)
+- Per graph type: ER / BA / BA-VM
+- Per n_bins: 3 / 5 / 8
+- Per perturbation type: KO / KD_010 / KD_050 / KD_080
+- Generalization to held-out bin (last bin withheld)
+
+---
+
+## 8. TOML and Training Command
 
 ```toml
 # configs/sergio_train.toml
 [datasets]
-sergio = "data/sergio_synthetic/train"
+sergio_er = "data/sergio_synthetic/train/ER"
+sergio_ba = "data/sergio_synthetic/train/BA"
 
 [training]
-sergio = "train"
-
-[zeroshot]
-# No zeroshot split for initial baseline — test set is separate
+sergio_er = "train"
+sergio_ba = "train"
 ```
-
-For train/val split: hold out a random 10% of GRN instances as validation (no cell types withheld — that's reserved for the fixed test set evaluation).
-
----
-
-## 6. Training Command
 
 ```bash
 state tx train \
@@ -201,107 +412,52 @@ state tx train \
   data.kwargs.batch_col=gem_group \
   data.kwargs.control_pert=non-targeting \
   data.kwargs.output_space=gene \
+  data.kwargs.perturbation_features_file=configs/pert_onehot_map.pt \
   training.max_steps=40000 \
   training.batch_size=8 \
   model=state \
+  model.kwargs.hidden_dim=768 \
   output_dir="$HOME/state_runs" \
   name="sergio_baseline"
 ```
 
-Key differences from real-data training:
-- `control_pert=non-targeting` (SERGIO doesn't have "non-targeting" guide; we label unperturbed cells this way)
-- `output_space=gene` (predict back to HVG space, n_hvgs = n_genes for synthetic data)
-- `pert_dim` is set automatically from the one-hot map size = n_unique_perturbation_names in the training set
+Model dimensions:
 
----
-
-## 7. Model Dimensions
-
-With 400 genes (all used as HVGs), 20 perturbation types per GRN × 500 GRN instances = 10,000 unique pert names across the full training set. The `pert_encoder` MLP input dim will be 10,000 (one-hot). This is large but manageable (the first linear layer maps 10k → 768).
-
-Alternative: use a **gene-position** encoding instead of name-based one-hot. Set `pert_dim = n_genes` and encode each perturbation as a binary vector with 1 at the knocked-out gene's index. This makes pert encoding consistent and compact regardless of GRN count:
-- `pert_dim = 400` (same as n_genes)
-- `pert_emb[gene_idx] = 1`, all others = 0
-- Requires a custom `pert_onehot_map` builder in the data pipeline
-
-**Recommendation**: start with name-based one-hot (simpler, uses existing machinery). Switch to gene-position encoding if pert_encoder convergence is slow.
-
----
-
-## 8. Evaluation
-
-Use `cell-eval` via `state tx predict`. Point at the fixed test set TOML:
-
-```bash
-state tx predict \
-  --output-dir $HOME/state_runs/sergio_baseline \
-  --checkpoint final.ckpt \
-  --toml configs/sergio_test.toml
-```
-
-Metrics (from cell-eval):
-- Perturbation discrimination score
-- Pearson correlation of expression changes
-- AUPRC for DE gene prediction
-- Spearman correlation of log2FC
-- Effect size Spearman
-
-Synthetic advantage: ground-truth DEGs and log2FC are computed exactly from SERGIO outputs.
+- `input_dim = 2000` (basal_encoder input)
+- `output_dim = 2000` (project_out output)
+- `pert_dim = 2000` (pert_encoder input, gene-position binary)
+- `hidden_dim = 768`
 
 ---
 
 ## 9. Experiment Sweeps
 
-Run all sweeps against the fixed test set. Gate on baseline first.
 
-### 9.1 Baseline (run first)
-- 400 genes, no noise (dpd=0), 9 bins, 200 cells/bin, 20 KO perts on master regs
-- 500 GRN training instances, 40k steps
+| Sweep                  | Variable                   | Fixed                       |
+| ---------------------- | -------------------------- | --------------------------- |
+| Baseline               | —                          | BA, no noise, 500 instances |
+| Graph type             | ER vs BA training data     | no noise, 500 instances     |
+| Noise                  | dpd ∈ {0, low, high}       | BA, 500 instances           |
+| Data quantity          | 100/250/500/1000 instances | BA, no noise                |
+| Perturbation diversity | KO / KO+KD / KO+OE         | BA, no noise, 500 instances |
 
-### 9.2 Noise sweep (after baseline clears)
-- Conditions: none | dpd_low | dpd_high | outlier_low | lib_size_variation
-- Fix: 400 genes, 500 GRN instances
 
-### 9.3 GRN size sweep
-- 100 vs 400 genes
-- Fix: dpd_low, 500 GRN instances
-
-### 9.4 Data quantity sweep
-- 100 / 250 / 500 / 1000 GRN instances
-- Fix: 400 genes, dpd_low
-
-### 9.5 Perturbation diversity sweep
-- KO only | KO + KD | KO + OE
-- Fix: 400 genes, dpd_low, 500 GRN instances
+All sweeps evaluated on the fixed test set; metrics stratified by GRN type.
 
 ---
 
 ## 10. Checkpoint Transfer to Real Data
 
-Once a best synthetic config is found, load it as an initializer for real-data training:
+With 2000 synthetic genes matching Replogle's ~2000 HVGs, `basal_encoder` weights transfer directly:
 
 ```bash
 state tx train \
-  data.kwargs.toml_config_path=configs/replogle_train.toml \
+  data.kwargs.toml_config_path=configs/replogle.toml \
   data.kwargs.embed_key=X_hvg \
-  model.kwargs.init_from=$HOME/state_runs/sergio_best/checkpoints/final.ckpt \
+  model.kwargs.init_from=$HOME/state_runs/sergio_baseline/checkpoints/final.ckpt \
   name="replogle_from_sergio"
 ```
 
-State handles mismatched `pert_encoder` dimensions automatically (rebuilds the layer if pert_dim differs). The transformer backbone and basal_encoder weights transfer directly.
+`pert_encoder` is automatically rebuilt when pert_dim differs (real data uses name-based one-hot over ~750 perturbations). Transformer backbone and basal_encoder transfer directly.
 
----
 
-## 11. Questions
-
-1. **HVG selection on synthetic data**: Use all genes as HVGs (simplest, no info loss for small GRNs) or apply standard HVG selection? For 400 genes, using all is likely fine. For 100 genes, definitely use all. Recommend: skip HVG selection for synthetic, set `n_hvgs = n_genes`.
-
-2. **Perturbation encoding strategy**: Name-based one-hot (one entry per "gene_k_KO" × GRN instance, large but simple) vs. gene-position binary vector (pert_dim = n_genes, consistent across GRNs). The gene-position encoding requires a small custom data loader change. Which do you prefer?
-
-3. **Number of GRN training instances**: Plan proposes 500. Compute budget? At ~3 min/instance on CPU, 500 = ~25 CPU-hours (trivially parallelizable on SLURM). Training time is the bottleneck — more instances = more steps needed.
-
-4. **Noise level for baseline**: Start with zero noise (cleanest signal to verify learning) or dpd_low immediately? Zero noise risks overfitting to clean synthetic patterns that don't generalize.
-
-5. **Test set size**: Plan proposes 40 GRN instances (10 per stratification cell). Is this sufficient, or do you want more instances per sub-group?
-
-6. **How many bins (cell types) per GRN**: Plan uses 9 bins, holding out 2 for the generalization test. Should the held-out bins be consistent positions (e.g., always bins 0 and 1) or random per GRN instance?

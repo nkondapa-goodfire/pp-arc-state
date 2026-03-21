@@ -1,0 +1,9 @@
+[datasets]
+sergio_train = "/mnt/polished-lake/home/nkondapaneni/state/simulate/sergio/data/sergio_synthetic/train_merged"
+
+[training]
+sergio_train = "train"
+
+# Hold out bin_4 across all instances for validation
+[zeroshot]
+"sergio_train.bin_4" = "val"

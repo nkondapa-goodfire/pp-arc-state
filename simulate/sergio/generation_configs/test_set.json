@@ -1,0 +1,32 @@
+{
+  "pool_size": 2000,
+  "n_sc": 200,
+  "k_perts": 10,
+  "gene_strategy": "random_draw",
+  "sergio_kwargs": {
+    "noise_type": "dpd",
+    "decays": 0.8,
+    "sampling_state": 15,
+    "dt": 0.01,
+    "dynamics": false
+  },
+  "grn_types": {
+    "ER":    { "n_instances": 34, "sizes": [10, 50, 100],      "params": { "p_edge": 0.08 } },
+    "BA":    { "n_instances": 33, "sizes": [10, 50, 100, 200], "params": { "m": 2 } },
+    "BA-VM": { "n_instances": 33, "sizes": [10, 50, 100, 200], "params": { "m_weights": [0.57, 0.29, 0.14] } }
+  },
+  "n_bins_choices": [3, 5, 8],
+  "noise_levels": {
+    "none": 0.0,
+    "low":  0.1,
+    "high": 0.5
+  },
+  "seed_offset": 5000,
+  "pert_strengths": {
+    "KO":     1.0,
+    "KD_010": 0.1,
+    "KD_050": 0.5,
+    "KD_080": 0.8
+  },
+  "output_dir": "data/sergio_synthetic/test"
+}

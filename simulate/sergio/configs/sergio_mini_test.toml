@@ -1,0 +1,5 @@
+[datasets]
+sergio_mini_test = "/mnt/polished-lake/home/nkondapaneni/state/simulate/sergio/data/sergio_synthetic/test_mini_merged"
+
+[training]
+sergio_mini_test = "test"

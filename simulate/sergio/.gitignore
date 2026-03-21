@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated data (large, reproducible from scripts)
+data/
+
+# SLURM logs
+slurm_logs/
+
+# Test outputs (plots, CSVs)
+test_outputs/
+
+# SERGIO vendored sample datasets
+SERGIO/data_sets/
+
+# macOS
+.DS_Store
