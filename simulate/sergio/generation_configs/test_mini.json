@@ -1,6 +1,6 @@
 {
   "pool_size": 2000,
-  "n_bins": 5,
+  "n_bins": 10,
   "n_sc": 5,
   "k_perts": 10,
   "gene_strategy": "random_draw",
@@ -21,8 +21,8 @@
     "low":  0.1,
     "high": 0.5
   },
-  "n_seeds": 25,
-  "seed_offset": 5000,
+  "n_seeds": 4,
+  "seed_offset": 0,
   "pert_strengths": {
     "KO":     1.0,
     "KD_010": 0.1,

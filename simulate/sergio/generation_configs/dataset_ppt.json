@@ -1,8 +1,8 @@
 {
   "pool_size": 2000,
-  "n_bins": 10,
-  "n_sc": 5,
-  "k_perts": 10,
+  "n_bins": 5,
+  "n_sc": 25,
+  "k_perts": 7,
   "gene_strategy": "random_draw",
   "sergio_kwargs": {
     "noise_type": "dpd",
@@ -25,9 +25,8 @@
   "seed_offset": 0,
   "pert_strengths": {
     "KO":     1.0,
-    "KD_010": 0.1,
-    "KD_050": 0.5,
-    "KD_080": 0.8
+    "KD_020": 0.2,
+    "KD_060": 0.6
   },
-  "output_dir": "data/sergio_synthetic/mini"
+  "output_dir": "data/sergio_synthetic/SERGIO_PPT"
 }

@@ -22,7 +22,9 @@ def run_tx_train(cfg: DictConfig):
     import lightning.pytorch as pl
     import torch
     from cell_load.data_modules import PerturbationDataModule
-    from cell_load.utils.modules import get_datamodule
+    from cell_load.utils.modules import DATA_MODULE_DICT, get_datamodule
+    from ...tx.data.reptile import ReptileDataModule
+    DATA_MODULE_DICT.setdefault("ReptileDataModule", ReptileDataModule)
     from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.plugins.precision import MixedPrecision
 
@@ -206,6 +208,7 @@ def run_tx_train(cfg: DictConfig):
         cfg["name"],
         cfg["training"]["val_freq"],
         cfg["training"].get("ckpt_every_n_steps", 4000),
+        ckpt_steps=cfg["training"].get("ckpt_steps", None),
     )
     # Add BatchSpeedMonitorCallback to log batches per second to wandb
     batch_speed_monitor = BatchSpeedMonitorCallback()

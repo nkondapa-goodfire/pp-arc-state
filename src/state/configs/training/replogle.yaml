@@ -6,6 +6,7 @@ max_steps: 100000
 train_seed: 42
 val_freq: 2000
 ckpt_every_n_steps: 4000
+ckpt_steps: []
 gradient_clip_val: 10
 gradient_accumulation_steps: 1
 loss_fn: mse

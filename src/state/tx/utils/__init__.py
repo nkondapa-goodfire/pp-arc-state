@@ -5,8 +5,10 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.loggers.csv_logs import CSVLogger as BaseCSVLogger
 import csv
 import os
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 from os.path import join
+import lightning.pytorch as pl
+import torch
 
 
 class RobustCSVLogger(BaseCSVLogger):
@@ -127,7 +129,22 @@ def get_loggers(
     return loggers
 
 
-def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, _ckpt_every_n_steps: int):
+class VariableStepCheckpoint(Callback):
+    """Save a checkpoint at each step in an explicit list."""
+
+    def __init__(self, dirpath: str, steps: list[int]):
+        self.dirpath = dirpath
+        self.steps = set(steps)
+
+    def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if step in self.steps:
+            os.makedirs(self.dirpath, exist_ok=True)
+            path = os.path.join(self.dirpath, f"step=step={step}.ckpt")
+            trainer.save_checkpoint(path)
+
+
+def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, ckpt_every_n_steps: int, ckpt_steps: list[int] | None = None):
     """
     Create checkpoint callbacks based on validation frequency.
 
@@ -147,6 +164,20 @@ def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, _ckpt_ev
         every_n_train_steps=val_freq,
     )
     callbacks.append(best_ckpt)
+
+    if ckpt_steps is not None:
+        # Variable schedule: save at explicit steps
+        callbacks.append(VariableStepCheckpoint(dirpath=checkpoint_dir, steps=ckpt_steps))
+    else:
+        # Periodic checkpoint every N steps regardless of val_loss
+        periodic_ckpt = ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="step={step}",
+            save_top_k=-1,
+            save_last=True,
+            every_n_train_steps=ckpt_every_n_steps,
+        )
+        callbacks.append(periodic_ckpt)
 
     return callbacks
 
@@ -188,6 +219,19 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
             output_dim=var_dims["output_dim"],
             pert_dim=var_dims["pert_dim"],
             batch_dim=var_dims["batch_dim"],
+            **module_config,
+        )
+    elif model_type.lower() == "reptile":
+        from ...tx.models.state_transition_reptile import StateTransitionReptileModel
+
+        return StateTransitionReptileModel(
+            input_dim=var_dims["input_dim"],
+            gene_dim=gene_dim,
+            hvg_dim=var_dims["hvg_dim"],
+            output_dim=var_dims["output_dim"],
+            pert_dim=var_dims["pert_dim"],
+            batch_dim=var_dims["batch_dim"],
+            basal_mapping_strategy=data_config["basal_mapping_strategy"],
             **module_config,
         )
     elif model_type.lower() == "neuralot" or model_type.lower() == "pertsets" or model_type.lower() == "state":

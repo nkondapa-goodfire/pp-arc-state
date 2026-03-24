@@ -19,13 +19,13 @@ sweep.
 Our SERGIO H5AD columns map directly to what the data module expects:
 
 
-| SERGIO `obs` column | `state tx train` kwarg | Value           |
-| ------------------- | ---------------------- | --------------- |
-| `gene`              | `pert_col`             | `gene`          |
-| `cell_type`         | `cell_type_key`        | `cell_type`     |
-| `gem_group`         | `batch_col`            | `gem_group`     |
-| `non-targeting`     | `control_pert`         | `non-targeting` |
-| `X` (sparse CSR)    | `embed_key`            | `None`          |
+| SERGIO `obs` column | `state tx train` kwarg | Value           | Semantics |
+| ------------------- | ---------------------- | --------------- | --------- |
+| `gene`              | `pert_col`             | `gene`          | Perturbation identity (`SYN_0042_KD_010` or `non-targeting`) |
+| `cell_type`         | `cell_type_key`        | `cell_type`     | GRN seed — the "cell line" analog (distinct regulatory topology) |
+| `gem_group`         | `batch_col`            | `gem_group`     | Bin — minor variation of the same GRN (different master-regulator rates) |
+| `non-targeting`     | `control_pert`         | `non-targeting` | Control perturbation label |
+| `X_hvg` (obsm)      | `embed_key`            | `X_hvg`         | Log-normalized expression used as model input |
 
 
 Model dimensions:
@@ -75,7 +75,7 @@ Build once; reuse for all training runs. Place at `simulate/sergio/configs/pert_
 
 `cell-load` discovers H5AD files by scanning the directory listed in `[datasets]`.
 Each unique value of `obs[batch_col]` (`gem_group`) acts as a mini-batch label;
-each unique value of `obs[cell_type_key]` (`cell_type`) acts as a cell type.
+each unique value of `obs[cell_type_key]` (`cell_type` = `grn_XXXX`) acts as a cell type (the "cell line" analog — seed = GRN topology; bin = minor variation within same GRN, stored in `gem_group`).
 
 The `*_merged` directories (see §8.1) contain one H5AD per condition
 `(grn_type, grn_size, noise_level, pert_type)`. Ablation runs point at a symlink
@@ -123,7 +123,7 @@ cd /mnt/polished-lake/shared/models/state/state
 uv run state tx train \
   data.kwargs.toml_config_path=/abs/path/to/configs/sergio_mini_train.toml \
   data.kwargs.pert_col=gene \
-  data.kwargs.cell_type_key=cell_type \
+  data.kwargs.cell_type_key=grn_seed \
   data.kwargs.batch_col=gem_group \
   data.kwargs.control_pert=non-targeting \
   data.kwargs.output_space=all \
@@ -232,16 +232,16 @@ uv run state tx infer \
 
 Metrics to compute per prediction file:
 
-- **Pearson r** between predicted and observed mean perturbed expression across genes
-- **Mean |log2FC| error**: `|predicted_log2FC - actual_log2FC|` per gene, averaged
-- **Held-out bin generalization**: same metrics restricted to `obs["split"] == "held_out"` cells
+- **Pearson Δ Corr**: Pearson r between predicted and observed pseudobulk expression delta (perturbed − control), averaged across perturbations
+- **Log2FC Spearman**: Spearman correlation of log fold changes restricted to true-significant DE genes
 
-Stratify by:
+Stratify by the 2-condition evaluation framework (see Section 7) and by:
 
 - `grn_type` (ER / BA / BA-VM)
-- `n_bins` (3 / 5 / 8)
 - `pert_type` (KO / KD_010 / KD_050 / KD_080)
 - `ko_out_degree` (hub vs leaf perturbations)
+
+Note: ignore the `obs["split"]` column — all test seeds (5000–5024) are out-of-sample regardless of bin label.
 
 ### 5.6 Full dataset training
 
@@ -277,7 +277,7 @@ synthetic test set. The design principle: the base condition is the one closest 
 If adding the cleaner condition improves test performance, it suggests synthetic data's clean
 signal scaffolds learning — a positive indicator for synthetic→real transfer.
 
-All runs use the same fixed test set for evaluation (seeds 5000–5099, stratified ER/BA/BA-VM).
+All runs use the same fixed test set for evaluation (see Section 7).
 
 The merged directory contains files named `{grn_type}_size{n}_noise{label}_{pert_type}.h5ad`.
 For each ablation, create a symlink directory containing only the matching files and point
@@ -329,6 +329,76 @@ for _, row in filtered.iterrows():
 | 2   | Does energy distance loss converge well on SERGIO's structured expression (mostly zeros)?   | Watch train loss in Step 5.4 — if stuck, try `loss=mse` first                                                                       |
 | 3   | Does `obs["split"]` (train/held_out) need to be communicated to the TOML, or is it ignored? | `cell-load` uses only TOML zeroshot/fewshot sections for splits — `obs["split"]` is for our own eval filtering, not the data module |
 
+
+---
+
+## 7. Evaluation Framework
+
+### Rationale
+
+Each GRN seed is a distinct regulatory network — the "cell line" analog. Bins are stochastic
+expression realizations of the same GRN (different master regulator basal rates), not
+independent cell lines. Out-of-GRN generalization is not meaningfully learnable: the same
+gene can be a hub activator in one GRN and a leaf repressor in another, and neither the
+perturbation embedding nor the control expression can resolve this for an unseen GRN. This is addressed by the
+State Embedding model which can represent cells with similar gene expression counts, but different underlying 
+GRNs differently. 
+
+The Replogle zeroshot task (predict perturbation effects in a held-out cell line, given the
+model has seen those perturbations in other cell lines) is also not reproducible: it requires
+contexts with genuinely different regulatory topologies and genes with consitent relationships to other genes.
+This simulation is constructed with completely random networks where genes do not preserve a consistent relationship
+
+The meaningful evaluation is **in-cell-line perturbation holdout** — analogous to Replogle's
+fewshot setup. All 4 training seeds are used; the question is whether the model can predict
+perturbation effects it was not trained on within a GRN it has seen.
+
+Dataset design: **4 seeds × 10 bins** per graph type. All 10 bins used for training (no bin
+holdout). Perturbation holdout handled at training time via TOML `[fewshot]`.
+
+---
+
+### 7.1 Evaluation conditions
+
+For each of the 4 seeds, the K=10 perturbable genes are split at training time:
+
+| Condition | # genes | Training treatment | Tests |
+|-----------|---------|-------------------|-------|
+| pert-type-holdout | 3 | 3 of 4 pert_types seen (e.g. KO + KD_050 + KD_080); KD_010 held out | Interpolation across perturbation strength |
+| in-CL-common | 7 | All pert_types seen normally (~50 cells) | Upper bound / interpolation |
+
+`in-CL-excluded` and `in-CL-underrepresented` are not used. Excluded requires causal
+discovery from observational data — not learnable when GRN roles are random across seeds.
+Underrepresented has no native cell-load TOML support (no per-perturbation fraction key).
+
+Holdout specified via TOML `[fewshot]` per seed, generated deterministically from the
+per-seed manifest by `scripts/build_inCL_holdout_toml.py`.
+
+```toml
+[datasets]
+sergio_mini = ".../mini_incl_merged"
+
+[training]
+sergio_mini = "train"
+
+[zeroshot]
+
+[fewshot]
+# pert-type-holdout: 3 genes seen with KO/KD_050/KD_080 only; KD_010 held out as test
+# Repeated for each bin (bin_0 … bin_9) since fewshot operates at (dataset, cell_type) level
+[fewshot."sergio_mini.bin_0"]
+test = ["SYN_0042_KD_010", "SYN_0019_KD_010", "SYN_0077_KD_010"]
+[fewshot."sergio_mini.bin_1"]
+test = ["SYN_0042_KD_010", "SYN_0019_KD_010", "SYN_0077_KD_010"]
+# ... generated for bin_0 through bin_9 by scripts/build_inCL_holdout_toml.py
+```
+
+---
+
+### 7.2 Out-of-GRN sanity check (seed 4, optional)
+
+One additional seed never seen during training. Expected near-random performance — confirms
+the model is not somehow generalizing across random GRNs. Not a primary evaluation target.
 
 ---
 

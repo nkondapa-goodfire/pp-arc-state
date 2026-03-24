@@ -29,5 +29,5 @@
     "KD_050": 0.5,
     "KD_080": 0.8
   },
-  "output_dir": "data/sergio_synthetic/mini"
+  "output_dir": "data/sergio_synthetic/test_mini_incl"
 }

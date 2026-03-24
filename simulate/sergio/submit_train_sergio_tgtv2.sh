@@ -1,32 +1,24 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=state_ablation
-#SBATCH --time=12:00:00
+#SBATCH --job-name=state_train_sergio_tgtv2
+#SBATCH --time=08:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus=8
 #SBATCH --ntasks-per-node=1
-#SBATCH --output=slurm_logs/ablation_%x_%j.out
-#SBATCH --error=slurm_logs/ablation_%x_%j.err
+#SBATCH --output=slurm_logs/state_train_sergio_tgtv2_%j.out
+#SBATCH --error=slurm_logs/state_train_sergio_tgtv2_%j.err
 
-# Usage: sbatch --job-name=<run_name> submit_train_ablation.sh <run_name>
-#   e.g. sbatch --job-name=ablation_ba_only submit_train_ablation.sh ablation_ba_only
+# sergio_tgtv2: SERGIO_TGT scratch baseline, 25k steps, no pre-pre-training
+# Uses corrected cell_type encoding (grn_type + grn_size + grn_seed)
+# Spec: plan3.md Section 3.2 (sergio_tgt)
 
 set -euo pipefail
 
-RUN_NAME="${1:?Usage: sbatch submit_train_ablation.sh <run_name>}"
-
 SERGIO_DIR="/mnt/polished-lake/home/nkondapaneni/state/simulate/sergio"
 STATE_DIR="/mnt/polished-lake/home/nkondapaneni/state"
-TOML="${SERGIO_DIR}/configs/ablations/${RUN_NAME}.toml"
-
-if [[ ! -f "${TOML}" ]]; then
-    echo "ERROR: TOML not found: ${TOML}"
-    echo "Run: uv run python scripts/build_ablation_dirs.py first"
-    exit 1
-fi
 
 mkdir -p "${SERGIO_DIR}/slurm_logs"
 
-export WANDB_RUN_GROUP=sergio_ablations
+export WANDB_RUN_GROUP=sergio_tgtv2
 export WANDB_START_METHOD=thread
 
 unset SLURM_NTASKS
@@ -34,26 +26,26 @@ unset SLURM_PROCID
 export MASTER_ADDR=localhost
 export MASTER_PORT=29500
 
-echo "Starting ablation run: ${RUN_NAME}"
-echo "TOML: ${TOML}"
-
 cd "${STATE_DIR}"
 uv run state tx train \
-  data.kwargs.toml_config_path="${TOML}" \
+  data.kwargs.toml_config_path="${SERGIO_DIR}/configs/sergio_tgt_train.toml" \
   data.kwargs.embed_key=X_hvg \
   data.kwargs.pert_col=gene \
   data.kwargs.cell_type_key=cell_type \
   data.kwargs.batch_col=gem_group \
   data.kwargs.control_pert=non-targeting \
   data.kwargs.output_space=gene \
-  data.kwargs.perturbation_features_file="${SERGIO_DIR}/configs/pert_onehot_map.pt" \
+  data.kwargs.perturbation_features_file="${SERGIO_DIR}/configs/pert_onehot_map_tgt.pt" \
   data.kwargs.num_workers=12 \
   data.kwargs.pin_memory=true \
   model=replogle \
   training=replogle \
+  training.max_steps=25000 \
+  training.val_freq=2000 \
+  "training.ckpt_steps=[200,400,600,800,1000,1200,1400,2000,2200,2400,2600,2800,3000,4000,8000,14000,20000,25000]" \
   training.devices=8 \
   training.strategy=ddp_find_unused_parameters_true \
   output_dir=/mnt/polished-lake/home/nkondapaneni/state_runs \
-  name="${RUN_NAME}" \
+  name=sergio_tgtv2 \
   wandb.entity=goodfire \
   use_wandb=true

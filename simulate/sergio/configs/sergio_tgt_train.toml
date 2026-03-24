@@ -1,0 +1,7 @@
+[datasets]
+sergio_tgt = "/mnt/polished-lake/home/nkondapaneni/state/simulate/sergio/data/sergio_synthetic/SERGIO_TGT_train_merged"
+
+[training]
+sergio_tgt = "train"
+
+[zeroshot]

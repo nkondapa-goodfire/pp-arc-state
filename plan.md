@@ -14,13 +14,11 @@ Define a vocabulary of 2000 synthetic gene names, fixed for the lifetime of this
 SYN_0000, SYN_0001, ..., SYN_1999
 ```
 
-Each GRN instance draws a subset of **~200 genes** from this pool (see Section 5 for sampling strategy). Genes not selected for a given GRN instance have zero expression for all cells in that instance. `X_hvg` is always `(n_cells, 2000)` across all GRN instances — consistent dimensionality, no alignment needed.
-
-**Why 200 genes per GRN**: SERGIO is well-validated at this scale (the original paper benchmarks down to 100-gene GRNs). It keeps simulation fast enough to generate many instances while still producing clear multi-hop perturbation cascades from master regulators.
+Each GRN instance draws a subset of **10, 50, or 100 genes** from this pool (see Section 5 for the size grid). Genes not selected for a given GRN instance have zero expression for all cells in that instance. `X_hvg` is always `(n_cells, 2000)` across all GRN instances — consistent dimensionality, no alignment needed.
 
 **Why the 2000-gene pool**: State's real training data (e.g., Replogle-Nadig) has all cells measuring the same fixed gene panel, with `preprocess_train` producing a consistent `X_hvg` shape across the full dataset. The fixed pool replicates this. Using 2000 matches the standard HVG count used for Replogle, so `basal_encoder` weights transfer directly at fine-tuning time.
 
-**HVG selection**: **Skip** — do not run `sc.pp.highly_variable_genes`. With 200 active genes per GRN and 1800 zeros, variance across the dataset is dominated by gene presence/absence rather than biological signal, making HVG selection unreliable. Use all 2000 dimensions directly as `X_hvg`.
+**HVG selection**: **Skip** — do not run `sc.pp.highly_variable_genes`. With ≤100 active genes per GRN and 1900+ zeros, variance across the dataset is dominated by gene presence/absence rather than biological signal, making HVG selection unreliable. Use all 2000 dimensions directly as `X_hvg`.
 
 **Sparsity**: Each cell vector is ~90% zeros. This is normal for scRNA-seq (high dropout) and does not require special handling.
 
@@ -73,7 +71,7 @@ def generate_er_grn(n_genes: int, p_edge: float, seed: int) -> nx.DiGraph:
     return enforce_dag(G, seed)
 ```
 
-Target post-DAG mean in-degree of 2–4; set `p_edge ≈ 0.02–0.04` (2× to account for DAG pruning).
+Actual parameter used: `p_edge = 0.08`.
 
 ### 3.2 Barabási–Albert (BA) — power-law degree distribution
 
@@ -124,7 +122,7 @@ Compared to fixed-m BA at simulation time:
 ```python
 adata.uns["grn_type"] = "ER" | "BA" | "BA-VM"
 adata.uns["grn_seed"] = <int>
-adata.uns["grn_params"] = {"p_edge": 0.015} | {"m": 2} | {"m_weights": [0.57, 0.29, 0.14]}
+adata.uns["grn_params"] = {"p_edge": 0.08} | {"m": 2} | {"m_weights": [0.57, 0.29, 0.14]}
 adata.uns["grn_gene_indices"] = [42, 107, 883, ...]  # indices into the 2000-gene pool
 adata.uns["grn_n_levels"] = nx.dag_longest_path_length(dag) + 1  # depth of the DAG
 adata.uns["grn_n_edges"] = dag.number_of_edges()
@@ -166,41 +164,36 @@ adata.obsm["X_hvg"] = adata.X.toarray()           # all 2000 genes, no HVG selec
 
 The training dataset is organized along three orthogonal axes so any subset can be isolated for ablation without regenerating data:
 
-| Axis             | Values                                                         |
-|------------------|----------------------------------------------------------------|
-| Graph type       | `ER`, `BA`, `BA-VM`                                           |
-| GRN size         | `10`, `50`, `100`, `200`, genes (ER capped at `100`)    |
-| Noise level      | `none` (0.0), `low` (0.1), `high` (0.5)                      |
-| Perturbation type | `KO`, `KD_010`, `KD_050`, `KD_080`, `KO+KD` (all four)      |
+| Axis              | Values                              |
+|-------------------|-------------------------------------|
+| Graph type        | `ER`, `BA`, `BA-VM`                 |
+| GRN size          | `10`, `50`, `100` genes             |
+| Noise level       | `none` (0.0), `low` (0.1), `high` (0.5) |
+| Perturbation type | `KO`, `KD_020`, `KD_060`            |
 
 KD strengths encode the fraction of gene silencing applied to basal rate and regulatory edge weights:
 
 | Label     | `pert_emb[k]` | Description              |
 |-----------|---------------|--------------------------|
 | `KO`      | 1.0           | Full knockout            |
-| `KD_010`  | 0.1           | 10% knockdown            |
-| `KD_050`  | 0.5           | 50% knockdown            |
-| `KD_080`  | 0.8           | 80% knockdown            |
+| `KD_020`  | 0.2           | 20% knockdown            |
+| `KD_060`  | 0.6           | 60% knockdown            |
 
-**100 seeds per cell** × 3 types × 5 sizes × 3 noise levels = **4500 GRN instances** total.
-Each instance generates **10 perturbations** (top-K by out-degree) × **4 perturbation types** = 40 h5ad files per instance, ~156k files total.
+**4 seeds** (seeds 0–3) × 3 types × 3 sizes × 3 noise levels = **108 GRN instances** total.
+Each instance generates **7 perturbations** (top-K by out-degree) × **3 perturbation types** = 21 h5ad files per instance, ~2268 files total.
 
 ### 5.2 Directory structure
 
 ```
-data/sergio_synthetic/
-  train/
-    {grn_type}/          # ER | BA | BA_VM
-      size_{n}/          # size_010 | size_050 | size_100 | size_200 | size_400
-        noise_{level}/   # noise_000 | noise_010 | noise_050
-          grn_{seed:04d}/
-            SYN_{k:04d}_KO.h5ad
-            SYN_{k:04d}_KD_010.h5ad
-            SYN_{k:04d}_KD_050.h5ad
-            SYN_{k:04d}_KD_080.h5ad
-            ...
-  test/
-    (same structure, seeds 5000–5099, disjoint from train)
+data/sergio_synthetic/SERGIO_PPT/
+  {grn_type}/          # ER | BA | BA_VM
+    size_{n}/          # size_010 | size_050 | size_100
+      noise_{level}/   # noise_000 | noise_010 | noise_050
+        grn_{seed:04d}/
+          SYN_{k:04d}_KO.h5ad
+          SYN_{k:04d}_KD_020.h5ad
+          SYN_{k:04d}_KD_060.h5ad
+          ...
   manifest.csv           # one row per h5ad: path + all group attributes
 ```
 
@@ -214,12 +207,11 @@ Any ablation is defined by filtering `manifest.csv` and passing the resulting pa
 |---------------------------------|-------------------------------------------------------------|
 | Graph type (ER only)            | `grn_type == "ER"`                                          |
 | Size sweep                      | `grn_type == "BA" & noise_level == "low"`                   |
-| Noise sweep                     | `grn_type == "BA" & grn_size == 200`                        |
+| Noise sweep                     | `grn_type == "BA" & grn_size == 100`                        |
 | KO only                         | `pert_type == "KO"`                                         |
 | KD only (all strengths)         | `pert_type.str.startswith("KD")`                            |
-| KD strength sweep               | `pert_type in ["KD_010", "KD_050", "KD_080"]`               |
-| KO + strong KD                  | `pert_type in ["KO", "KD_080"]`                             |
-| KO + all KD                     | `pert_type in ["KO", "KD_010", "KD_050", "KD_080"]`         |
+| KD strength sweep               | `pert_type in ["KD_020", "KD_060"]`                         |
+| KO + all KD                     | `pert_type in ["KO", "KD_020", "KD_060"]`                   |
 | Baseline (full)                 | no filter                                                   |
 
 The TOML config references a pre-filtered manifest rather than a directory, so switching ablations requires only swapping the manifest path.
@@ -237,11 +229,12 @@ pert_emb[k] = perturbation strength at gene k  (0 = no effect, 1 = full KO)
 
 Perturbation strength by type:
 
-| Type           | `pert_emb[k]` | `obs["gene"]`         |
-|----------------|---------------|-----------------------|
-| Non-targeting  | 0.0           | `"non-targeting"`     |
-| Knockout (KO)  | 1.0           | `"SYN_{k:04d}_KO"`   |
-| Knockdown (KD) | 0.5           | `"SYN_{k:04d}_KD"`   |
+| Type            | `pert_emb[k]` | `obs["gene"]`           |
+|-----------------|---------------|-------------------------|
+| Non-targeting   | 0.0           | `"non-targeting"`       |
+| Knockout (KO)   | 1.0           | `"SYN_{k:04d}_KO"`     |
+| Knockdown 20%   | 0.2           | `"SYN_{k:04d}_KD_020"` |
+| Knockdown 60%   | 0.6           | `"SYN_{k:04d}_KD_060"` |
 
 KO and KD of the same gene share position k — the magnitude encodes perturbation strength. The `pert_encoder` MLP receives float32 input so continuous values are natively supported; no architecture changes are needed. This allows the model to learn that larger values at position k correspond to stronger perturbation of gene k, and to interpolate between KD and KO.
 
@@ -250,7 +243,7 @@ Build a fixed `pert_onehot_map` once before any training run:
 ```python
 pert_onehot_map = {"non-targeting": np.zeros(2000, dtype=np.float32)}
 for k in range(2000):
-    for label, strength in [("KO", 1.0), ("KD_010", 0.1), ("KD_050", 0.5), ("KD_080", 0.8)]:
+    for label, strength in [("KO", 1.0), ("KD_020", 0.2), ("KD_060", 0.6)]:
         v = np.zeros(2000, dtype=np.float32)
         v[k] = strength
         pert_onehot_map[f"SYN_{k:04d}_{label}"] = v
@@ -289,18 +282,23 @@ def generate_instance(grn_seed, grn_type, grn_size, output_dir, params,
     # Use top-K by out-degree (robust across all graph types)
     top_regs = sorted(G.nodes(), key=lambda n: G.out_degree(n), reverse=True)[:K_PERTS]
 
+    # SERGIO simulation parameters (from dataset_ppt.json)
+    # n_bins=5, n_sc=25, noise_type="dpd", decays=0.8, sampling_state=15, dt=0.01, dynamics=False
+
     # 3. Simulate control
-    sim_ctrl = sergio(number_genes=grn_size, number_bins=N_BINS, number_sc=N_SC, ...)
+    sim_ctrl = sergio(number_genes=grn_size, number_bins=5, number_sc=25,
+                      noise_type="dpd", decays=0.8, sampling_state=15, dt=0.01, dynamics=False)
     sim_ctrl.build_graph(targets, regs)
     sim_ctrl.simulate()
-    ctrl_expr = sim_ctrl.getExpressions()   # (N_BINS, grn_size, N_SC)
+    ctrl_expr = sim_ctrl.getExpressions()   # (5, grn_size, 25)
 
-    # 4. Simulate KO and KD for each selected gene
+    # 4. Simulate KO and KD for each selected gene (k_perts=7, top-7 by out-degree)
     for local_idx in top_regs:
         global_idx = gene_indices[local_idx]   # index in the 2000-gene pool
 
-        for pert_type, strength in [("KO", 1.0), ("KD", 0.5)]:
-            sim_p = sergio(number_genes=grn_size, number_bins=N_BINS, number_sc=N_SC, ...)
+        for pert_type, strength in [("KO", 1.0), ("KD_020", 0.2), ("KD_060", 0.6)]:
+            sim_p = sergio(number_genes=grn_size, number_bins=5, number_sc=25,
+                           noise_type="dpd", decays=0.8, sampling_state=15, dt=0.01, dynamics=False)
             sim_p.build_graph(targets, regs)
             apply_perturbation(sim_p.graph_, local_idx, strength)  # scales basal/edges by (1 - strength)
             sim_p.simulate()
@@ -317,76 +315,75 @@ def generate_instance(grn_seed, grn_type, grn_size, output_dir, params,
             )
             preprocess(adata)
             adata.write_h5ad(f"{output_dir}/grn_{grn_seed:04d}/SYN_{global_idx:04d}_{pert_type}.h5ad")
+# output_dir = "data/sergio_synthetic/SERGIO_PPT/{grn_type}/size_{grn_size:03d}/noise_{noise_level}"
 ```
 
 `build_anndata_embedded` places SERGIO expression values at the active gene columns and leaves the other 1800 columns as zero.
 
 ### 6.2 Perturbation selection
 
-Use **top-K by out-degree** for both ER and BA graphs. This is robust — ER graphs may have few or no nodes with in-degree 0, but every graph has high-out-degree nodes. K=10 by default.
+Use **top-K by out-degree** for both ER and BA graphs. This is robust — ER graphs may have few or no nodes with in-degree 0, but every graph has high-out-degree nodes. **K=7** (`k_perts=7` in `dataset_ppt.json`).
 
 Each KO perturbation's out-degree is stored in `adata.obs["ko_out_degree"]` (set to -1 for non-targeting cells). This enables post-hoc analysis of whether model prediction quality correlates with KO gene influence — hub KOs (high out-degree) produce strong cascades while low-degree KOs have minimal effect. Useful diagnostic for understanding what the model has actually learned before fine-tuning on real data.
 
 ### 6.3 Directory structure
 
 ```
-data/sergio_synthetic/
-  train/
-    ER/
-      grn_0000/
-        SYN_0042_KO.h5ad   # control + KO cells, 2000-gene vectors
-        SYN_0107_KO.h5ad
-        ...
-      grn_0001/ ...
-    BA/
-      grn_1000/ ...
-  test/
-    ER/  grn_5000/ ...
-    BA/  grn_5500/ ...
+data/sergio_synthetic/SERGIO_PPT/
+  ER/
+    size_010/noise_000/grn_0000/  SYN_0042_KO.h5ad  SYN_0042_KD_020.h5ad  SYN_0042_KD_060.h5ad ...
+    size_010/noise_010/...
+    size_050/...
+    size_100/...
+  BA/
+    size_010/...
+    ...
+  BA-VM/
+    ...
 ```
 
 ### 6.4 SLURM array job
 
 ```bash
-# ER graphs (seeds 0–499)
-sbatch --array=0-499 --cpus-per-task=4 \
-  --wrap="python scripts/generate_sergio_dataset.py \
-    --grn-seed \$SLURM_ARRAY_TASK_ID \
-    --grn-type ER --p-edge 0.015 \
-    --pool-size 2000 --grn-size 200 \
-    --n-bins 9 --n-sc 200 --k-perts 10 \
-    --gene-strategy random_draw \
-    --output-dir data/sergio_synthetic/train/ER"
+# Driven by dataset_ppt.json (seeds 0–3, sizes 10/50/100, all three GRN types)
+python scripts/generate_sergio_dataset.py \
+  --config generation_configs/dataset_ppt.json \
+  --output-dir data/sergio_synthetic/SERGIO_PPT
 
-# BA graphs (seeds 1000–1499)
-sbatch --array=1000-1499 --cpus-per-task=4 \
-  --wrap="python scripts/generate_sergio_dataset.py \
-    --grn-seed \$SLURM_ARRAY_TASK_ID \
-    --grn-type BA --m 2 \
-    --pool-size 2000 --grn-size 200 \
-    --n-bins 9 --n-sc 200 --k-perts 10 \
-    --gene-strategy random_draw \
-    --output-dir data/sergio_synthetic/train/BA"
+# Key parameters from dataset_ppt.json:
+#   pool_size=2000, n_bins=5, n_sc=25, k_perts=7, gene_strategy=random_draw
+#   n_seeds=4 (seeds 0–3), seed_offset=0
+#   ER: sizes=[10,50,100], p_edge=0.08
+#   BA: sizes=[10,50,100], m=2
+#   BA-VM: sizes=[10,50,100], m_weights=[0.57,0.29,0.14]
+#   noise_levels: none=0.0, low=0.1, high=0.5
+#   pert_strengths: KO=1.0, KD_020=0.2, KD_060=0.6
+#   sergio_kwargs: noise_type=dpd, decays=0.8, sampling_state=15, dt=0.01, dynamics=false
 ```
 
 ---
 
 ## 7. Fixed Test Set
 
-- Seeds 5000–5099 (100 instances total), disjoint from training
-- Stratified: **ER** (34 instances) × **BA** (33 instances) × **BA-VM** (33 instances)
-- **n_bins sampled from {3, 5, 8}** — each GRN instance is assigned one bin count at generation time, balanced across the 100 seeds
-- 200 cells/bin, 10 perturbations per GRN (KO + KD_010 + KD_050 + KD_080)
-- For each GRN, the **last bin** is withheld as a held-out cell type (bin index `n_bins - 1`), fixed at generation time
+- Seeds disjoint from training (training uses seeds 0–3 per `dataset_ppt.json`)
+- Stratified: **ER** × **BA** × **BA-VM**, matched sizes and noise levels to training
+- **n_bins = 5**, **n_sc = 25** per bin (matching `dataset_ppt.json`)
+- Perturbations per GRN: **KO + KD_020 + KD_060** (matching `dataset_ppt.json`)
+- `bin_4` is the zero-shot held-out cell type — withheld from training via TOML `[zeroshot]`
 - Preprocessed and stored at generation time; never modified
+
+**Note on bin semantics:** Bins represent different cell types within a single GRN seed. All bins
+share the same GRN topology (edges, K, hill coefficients) but differ in their master-regulator
+basal rates, producing different steady-state expression profiles. Bin labels (bin_0…bin_4) are
+ordinal within a seed — `bin_0` in seed 0 and `bin_0` in seed 5000 are unrelated (different
+topology, different basal rates). There is no cross-seed correspondence between same-named bins.
 
 Metrics computed:
 
-- Overall (all 100 GRNs)
+- Overall (all instances)
 - Per graph type: ER / BA / BA-VM
-- Per n_bins: 3 / 5 / 8
-- Per perturbation type: KO / KD_010 / KD_050 / KD_080
-- Generalization to held-out bin (last bin withheld)
+- Per perturbation type: KO / KD_020 / KD_060
+- Zero-shot generalization: `bin_4` (never seen during training) vs bins 0–3 (seen cell types, new seeds)
 
 ---
 
