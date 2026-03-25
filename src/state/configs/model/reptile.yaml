@@ -3,9 +3,9 @@ checkpoint: null
 device: cuda
 
 kwargs:
-  cell_set_len: 512
+  cell_set_len: 64
   blur: 0.05
-  hidden_dim: 768
+  hidden_dim: 328
   loss: energy
   confidence_token: False
   n_encoder_layers: 1
@@ -16,8 +16,10 @@ kwargs:
   transformer_decoder: False
   finetune_vci_decoder: False
   residual_decoder: False
-  batch_encoder: False
+  batch_encoder: True
+  cell_type_encoder: False
   use_batch_token: False
+  nb_decoder: False
   mask_attn: False
 
   use_effect_gating_token: False
@@ -25,7 +27,6 @@ kwargs:
   init_from: null
   mmd_num_chunks: 1
   randomize_mmd_chunks: false
-  llm_name: null
 
   transformer_backbone_key: llama
   transformer_backbone_kwargs:

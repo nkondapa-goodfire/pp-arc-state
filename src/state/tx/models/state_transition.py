@@ -112,6 +112,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         output_dim: int,
         pert_dim: int,
         batch_dim: int = None,
+        cell_type_dim: int = None,
         basal_mapping_strategy: str = "random",
         predict_residual: bool = True,
         distributional_loss: str = "energy",
@@ -195,6 +196,16 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 embedding_dim=hidden_dim,
             )
             self.batch_dim = batch_dim
+
+        # Add an optional encoder that introduces a cell-type/cell-line label
+        self.cell_type_encoder = None
+        self.cell_type_dim = None
+        if kwargs.get("cell_type_encoder", False) and cell_type_dim is not None:
+            self.cell_type_encoder = nn.Embedding(
+                num_embeddings=cell_type_dim,
+                embedding_dim=hidden_dim,
+            )
+            self.cell_type_dim = cell_type_dim
 
         # Optional batch predictor ablation: learns a single batch token added to every position,
         # and adds an auxiliary per-token batch classification head + CE loss.
@@ -439,6 +450,23 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Get batch embeddings and add to sequence input
             batch_embeddings = self.batch_encoder(batch_indices.long())  # Shape: [B, S, hidden_dim]
             seq_input = seq_input + batch_embeddings
+
+        if self.cell_type_encoder is not None:
+            cell_type_indices = batch["cell_type_onehot"]
+
+            # Handle one-hot encoded cell type indices
+            if cell_type_indices.dim() > 1 and cell_type_indices.size(-1) == self.cell_type_dim:
+                cell_type_indices = cell_type_indices.argmax(-1)
+
+            # Reshape to match sequence structure
+            if padded:
+                cell_type_indices = cell_type_indices.reshape(-1, self.cell_sentence_len)
+            else:
+                cell_type_indices = cell_type_indices.reshape(1, -1)
+
+            # Get cell type embeddings and add to sequence input
+            cell_type_embeddings = self.cell_type_encoder(cell_type_indices.long())  # Shape: [B, S, hidden_dim]
+            seq_input = seq_input + cell_type_embeddings
 
         if self.use_batch_token and self.batch_token is not None:
             batch_size, _, _ = seq_input.shape

@@ -3,20 +3,25 @@ reptile.py — Task-grouped sampling and data module for Reptile meta-learning.
 
 TaskGroupedBatchSampler
 -----------------------
-Subclasses PerturbationBatchSampler. Reuses its sentence-building logic
-(sentences are lists of cell_sentence_len global indices, all from the same
-(cell_type, pert) group). Then groups those sentences by cell_type, so that
-each outer step yields k * cell_sentence_len indices all from the same GRN task.
+Standalone batch sampler (does not inherit PerturbationBatchSampler).
 
-Each call to __iter__ yields one flat list of k * cell_sentence_len indices.
-The DataLoader delivers this list as k * cell_sentence_len individual samples,
-which task_collate_fn splits into k collated mini-batches.
+At construction it builds _task_to_cells: {task_key: [global_idx, ...]},
+mapping each GRN task to every cell index that belongs to it across all
+h5 subsets.
+
+Each call to __iter__ yields one flat list of k_inner * cell_sentence_len
+indices, freshly sampled without replacement from the task's cell pool
+(with replacement only when the pool is smaller than the request).
+Sampling is fresh every epoch, so no cell membership is fixed across steps.
+
+The DataLoader delivers this list as k_inner * cell_sentence_len individual
+samples, which task_collate_fn splits into k_inner collated mini-batches.
 
 task_collate_fn
 ---------------
-Receives the flat list of k * cell_sentence_len samples from the DataLoader.
-Splits into k groups of cell_sentence_len, collates each with
-PerturbationDataset.collate_fn, returns List[Dict[str, Tensor]] of length k.
+Receives the flat list of k_inner * cell_sentence_len samples from the DataLoader.
+Splits into k_inner groups of cell_sentence_len, collates each with
+PerturbationDataset.collate_fn, returns List[Dict[str, Tensor]] of length k_inner.
 This is the format expected by ReptilePerturbationModel.training_step.
 
 ReptileDataModule
@@ -30,20 +35,18 @@ reptile gradients across GPUs — this is the batched Reptile / SimuParallelSGD
 update (correct behavior, no synchronization of samplers needed).
 """
 
-import bisect
 import logging
+from collections import defaultdict
 from functools import partial
-from pathlib import Path
 from typing import Callable, Iterator, List, Optional
 
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import Sampler, DataLoader
 
 from cell_load.data_modules.perturbation_dataloader import (
     PerturbationDataModule,
     _worker_init_fn,
 )
-from cell_load.data_modules.samplers import PerturbationBatchSampler
 from cell_load.dataset._perturbation import PerturbationDataset
 from cell_load.dataset._metadata import MetadataConcatDataset
 
@@ -55,38 +58,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class TaskGroupedBatchSampler(PerturbationBatchSampler):
+class TaskGroupedBatchSampler(Sampler):
     """
     Yields batches of k_inner * cell_sentence_len indices, all from the same
-    cell_type (GRN task). Each group of cell_sentence_len indices becomes one
+    cell_type (GRN task).  Each group of cell_sentence_len indices becomes one
     inner-loop mini-batch after task_collate_fn processes the flat list.
 
-    Sentences (groups of cell_sentence_len indices sharing the same
-    (cell_type, pert)) are built by the parent class. They are then regrouped
-    by task key, so k_inner sentences drawn from the same task vary in
-    perturbation identity — exactly the inner-loop variation Reptile needs.
+    At construction, every cell in every h5 subset is assigned to a task key
+    (= cell_type string, or h5_prefix/cell_type if h5_to_task_prefix_fn is
+    given).  _task_to_cells stores the full pool of global indices per task.
 
-    The task key combines a per-h5-file prefix with the cell_type name.
-    By default the prefix is the h5 filename stem (so each file is its own
-    task namespace). Pass ``h5_to_task_prefix_fn`` to extract a coarser
-    grouping — e.g., for SERGIO, extract (grn_type, grn_size) so that cells
-    from the same GRN topology but different noise levels / pert types all
-    contribute to the same task pool.
+    Each __iter__ call freshly samples k_inner perturbations from the task's
+    pert pool, then draws cell_sentence_len cells from each — no fixed
+    sentences, no partial-sentence edge cases, different cell combinations
+    every epoch.  Each inner batch is homogeneous in perturbation identity,
+    and the k_inner batches vary in perturbation — exactly what Reptile needs.
 
     Args:
         dataset:              MetadataConcatDataset
         k_inner:              Inner-loop mini-batches per outer step.
         cell_sentence_len:    Cells per mini-batch (= model's cell_set_len).
         shuffle:              Shuffle task order each epoch. Default True.
-        seed:                 Base RNG seed. Epoch offset added each iteration.
-        h5_to_task_prefix_fn: ``(h5_path: str) -> str`` — maps an h5 file path
-                              to a string prefix that identifies which group of
-                              files belongs to the same task. Files with the same
-                              prefix AND the same cell_type are merged into one
-                              task. Default: use the full filename stem (each
-                              file is its own prefix, giving fine-grained tasks).
-        **kwargs:             Forwarded to PerturbationBatchSampler (drop_last,
-                              use_batch, downsample_cells, …).
+        seed:                 Base RNG seed. Incremented each epoch via set_epoch().
+        h5_to_task_prefix_fn: Optional ``(h5_path: str) -> str`` — maps an h5
+                              file path to a prefix prepended to cell_type to
+                              form the task key.  Default: cell_type alone.
     """
 
     def __init__(
@@ -97,83 +93,62 @@ class TaskGroupedBatchSampler(PerturbationBatchSampler):
         shuffle: bool = True,
         seed: int = 0,
         h5_to_task_prefix_fn: Optional[Callable[[str], str]] = None,
-        **kwargs,
     ):
+        self.dataset = dataset
         self.k_inner = k_inner
+        self.cell_sentence_len = cell_sentence_len
         self.shuffle = shuffle
-        # Default: no prefix — cell_type alone is the task key.
-        # Pass a function here when cell_type is ambiguous across files
-        # (e.g., when cell_type encodes only a seed and the file name carries
-        # graph-type / graph-size information).
+        self.seed = seed
+        self.epoch = 0
         self._h5_to_task_prefix_fn = h5_to_task_prefix_fn
 
-        # Parent builds self.sentences and self.metadata_caches.
-        # batch_size is unused in our __iter__ but required by parent __init__.
-        super().__init__(
-            dataset=dataset,
-            batch_size=k_inner,
-            cell_sentence_len=cell_sentence_len,
-            seed=seed,
-            **kwargs,
-        )
+        # task_key → pert_key → [global_idx, ...]
+        self._task_to_pert_cells: dict[str, dict[str, list[int]]] = self._build_task_to_pert_cells()
+        self._task_keys: list[str] = list(self._task_to_pert_cells.keys())
 
-        # Group sentences by compound task key.
-        self._task_to_sentences: dict[str, list[int]] = self._group_sentences_by_task()
-        self._task_keys: list[str] = list(self._task_to_sentences.keys())
         logger.info(
-            "TaskGroupedBatchSampler: %d tasks, %d total sentences, k_inner=%d",
+            "TaskGroupedBatchSampler: %d tasks, k_inner=%d, cell_sentence_len=%d",
             len(self._task_keys),
-            len(self.sentences),
             self.k_inner,
+            self.cell_sentence_len,
         )
 
     # ------------------------------------------------------------------
-    # Sentence → task mapping
+    # Build cell pool per (task, pert)
     # ------------------------------------------------------------------
 
-    def _group_sentences_by_task(self) -> dict[str, list[int]]:
-        """Return {task_key: [sentence_idx, ...]} for all sentences."""
-        from collections import defaultdict
+    def _build_task_to_pert_cells(self) -> dict[str, dict[str, list[int]]]:
+        """Map each (task_key, pert_key) to all global cell indices."""
+        task_to_pert_cells: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        global_offset = 0
 
-        task_to_sentences: dict = defaultdict(list)
-        for sent_idx, sentence in enumerate(self.sentences):
-            task_key = self._task_key_for_global(sentence[0])
-            task_to_sentences[task_key].append(sent_idx)
-        return dict(task_to_sentences)
+        for subset in self.dataset.datasets:
+            base_dataset = subset.dataset
+            cache = base_dataset.metadata_cache
+            h5_path = base_dataset.h5_path
 
-    def _task_key_for_global(self, global_idx: int) -> str:
-        """
-        Resolve a global DataLoader index to a string task key.
+            prefix = (
+                self._h5_to_task_prefix_fn(h5_path)
+                if self._h5_to_task_prefix_fn is not None
+                else None
+            )
 
-        Task key = h5_task_prefix + "/" + cell_type_name, where:
-          - h5_task_prefix is derived from the h5 file path via
-            self._h5_to_task_prefix_fn (caller-supplied; default = file stem)
-          - cell_type_name is the string category for this cell's cell_type code
+            for local_pos, file_idx in enumerate(subset.indices):
+                ct_code = int(cache.cell_type_codes[file_idx])
+                ct_name = str(cache.cell_type_categories[ct_code])
+                task_key = f"{prefix}/{ct_name}" if prefix is not None else ct_name
 
-        Global indices are laid out as:
-          subset_0: [0 .. len(subset_0)-1]
-          subset_1: [len(subset_0) .. len(subset_0)+len(subset_1)-1]
-          ...
-        cumulative_sizes[i] == sum(len(subset_j) for j <= i).
-        """
-        cumulative = self.dataset.cumulative_sizes
-        ds_idx = bisect.bisect_right(cumulative, global_idx)
-        local_idx = global_idx - (cumulative[ds_idx - 1] if ds_idx > 0 else 0)
+                pert_code = int(cache.pert_codes[file_idx])
+                pert_key = str(cache.pert_categories[pert_code])
 
-        subset = self.dataset.datasets[ds_idx]
-        file_idx = int(subset.indices[local_idx])
-        h5_path = subset.dataset.h5_path
-        cache = self.metadata_caches[h5_path]
+                task_to_pert_cells[task_key][pert_key].append(global_offset + local_pos)
 
-        ct_code = int(cache.cell_type_codes[file_idx])
-        ct_name = str(cache.cell_type_categories[ct_code])
-        if self._h5_to_task_prefix_fn is not None:
-            prefix = self._h5_to_task_prefix_fn(h5_path)
-            return f"{prefix}/{ct_name}"
-        return ct_name
+            global_offset += len(subset)
+
+        return {t: dict(p) for t, p in task_to_pert_cells.items()}
 
     # ------------------------------------------------------------------
-    # Iterator
+    # Iterator — fresh sample every epoch
     # ------------------------------------------------------------------
 
     def __iter__(self) -> Iterator[list[int]]:
@@ -183,21 +158,26 @@ class TaskGroupedBatchSampler(PerturbationBatchSampler):
             rng.shuffle(task_keys)
 
         for task in task_keys:
-            sent_indices = self._task_to_sentences[task]
-            n_available = len(sent_indices)
-            replace = n_available < self.k_inner
-            if replace:
-                logger.debug(
-                    "Task %d has only %d sentences but k_inner=%d; sampling with replacement.",
-                    task,
-                    n_available,
-                    self.k_inner,
+            pert_keys = list(self._task_to_pert_cells[task].keys())
+            # Sample k_inner perts (with replacement if task has fewer perts than k_inner)
+            chosen_perts = rng.choice(
+                pert_keys,
+                size=self.k_inner,
+                replace=len(pert_keys) < self.k_inner,
+            )
+            flat: list[int] = []
+            for pert in chosen_perts:
+                pool = self._task_to_pert_cells[task][pert]
+                flat.extend(
+                    rng.choice(pool, size=self.cell_sentence_len, replace=len(pool) < self.cell_sentence_len).tolist()
                 )
-            chosen = rng.choice(sent_indices, size=self.k_inner, replace=replace).tolist()
-            yield [idx for i in chosen for idx in self.sentences[i]]
+            yield flat
 
     def __len__(self) -> int:
         return len(self._task_keys)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +195,7 @@ def task_collate_fn(
     collated mini-batch dicts, one per inner-loop step.
 
     Each returned dict has an extra key ``"task_key"`` (str) — the cell_type
-    of the GRN task shared by all k_inner mini-batches. This is the same value
-    as ``batch["cell_type"][0]`` but promoted to a top-level string for easy
-    logging and verification.
+    of the GRN task shared by all k_inner mini-batches.
 
     Args:
         samples:    Flat list delivered by DataLoader (k * cell_sentence_len).
@@ -225,9 +203,7 @@ def task_collate_fn(
         exp_counts: Passed through to PerturbationDataset.collate_fn.
 
     Returns:
-        List[Dict[str, Tensor]] of length k_inner. Each dict is a fully
-        collated mini-batch with shape (cell_sentence_len, feature_dim) tensors,
-        plus ``"task_key": str``.
+        List[Dict[str, Tensor]] of length k_inner.
     """
     n = len(samples)
     if n % k_inner != 0:
@@ -235,10 +211,6 @@ def task_collate_fn(
             f"task_collate_fn: expected {k_inner} * cells_per_batch samples, got {n}."
         )
     cells_per_inner = n // k_inner
-
-    # task_key = cell_type of the shared GRN task.
-    # With the updated SERGIO dataset, cell_type already encodes the full
-    # task identity (e.g. "BA-VM_size010_seed0000").
     task_key: str = str(samples[0]["cell_type"])
 
     return [
@@ -264,9 +236,10 @@ class ReptileDataModule(PerturbationDataModule):
     for Reptile: List[Dict[str, Tensor]] of length k_inner, one per outer step.
 
     All PerturbationDataModule constructor arguments are accepted unchanged.
-    One extra argument:
+    Extra arguments:
 
         k_inner (int, default 10): inner-loop steps per outer update.
+        h5_to_task_prefix_fn: optional callable mapping h5 path → task prefix.
     """
 
     def __init__(
@@ -292,9 +265,6 @@ class ReptileDataModule(PerturbationDataModule):
             cell_sentence_len=self.cell_sentence_len,
             shuffle=not test,
             seed=0,
-            drop_last=self.drop_last,
-            use_batch=self.basal_mapping_strategy == "batch",
-            downsample_cells=getattr(self, "downsample_cells", None),
             h5_to_task_prefix_fn=self._h5_to_task_prefix_fn,
         )
 

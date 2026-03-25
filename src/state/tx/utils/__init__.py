@@ -165,7 +165,7 @@ def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, ckpt_eve
     )
     callbacks.append(best_ckpt)
 
-    if ckpt_steps is not None:
+    if ckpt_steps:
         # Variable schedule: save at explicit steps
         callbacks.append(VariableStepCheckpoint(dirpath=checkpoint_dir, steps=ckpt_steps))
     else:
@@ -231,6 +231,7 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
             output_dim=var_dims["output_dim"],
             pert_dim=var_dims["pert_dim"],
             batch_dim=var_dims["batch_dim"],
+            cell_type_dim=var_dims.get("cell_type_dim"),
             basal_mapping_strategy=data_config["basal_mapping_strategy"],
             **module_config,
         )
@@ -244,6 +245,7 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
             output_dim=var_dims["output_dim"],
             pert_dim=var_dims["pert_dim"],
             batch_dim=var_dims["batch_dim"],
+            cell_type_dim=var_dims.get("cell_type_dim"),
             basal_mapping_strategy=data_config["basal_mapping_strategy"],
             **module_config,
         )

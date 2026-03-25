@@ -25,6 +25,8 @@ def run_tx_train(cfg: DictConfig):
     from cell_load.utils.modules import DATA_MODULE_DICT, get_datamodule
     from ...tx.data.reptile import ReptileDataModule
     DATA_MODULE_DICT.setdefault("ReptileDataModule", ReptileDataModule)
+    from ...tx.data.balanced import BalancedPerturbationDataModule
+    DATA_MODULE_DICT.setdefault("BalancedPerturbationDataModule", BalancedPerturbationDataModule)
     from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.plugins.precision import MixedPrecision
 
@@ -42,19 +44,22 @@ def run_tx_train(cfg: DictConfig):
     cfg_yaml = OmegaConf.to_yaml(cfg, resolve=True)
     cfg = OmegaConf.to_container(cfg, resolve=True)
 
-    # Setup output directory
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    # Setup output directory (rank 0 only to avoid DDP race conditions)
     run_output_dir = join(cfg["output_dir"], cfg["name"])
-    if os.path.exists(run_output_dir) and cfg["overwrite"]:
-        print(f"Output dir {run_output_dir} already exists, overwriting")
-        shutil.rmtree(run_output_dir)
-    os.makedirs(run_output_dir, exist_ok=True)
+    if local_rank == 0:
+        if os.path.exists(run_output_dir) and cfg["overwrite"]:
+            print(f"Output dir {run_output_dir} already exists, overwriting")
+            shutil.rmtree(run_output_dir)
+        os.makedirs(run_output_dir, exist_ok=True)
 
-    # Set up wandb directory if needed
-    if cfg["use_wandb"]:
-        os.makedirs(cfg["wandb"]["local_wandb_dir"], exist_ok=True)
-
-    with open(join(run_output_dir, "config.yaml"), "w") as f:
-        f.write(cfg_yaml)
+    # Set up wandb directory if needed (rank 0 only)
+    if local_rank == 0:
+        if cfg["use_wandb"]:
+            os.makedirs(cfg["wandb"]["local_wandb_dir"], exist_ok=True)
+        with open(join(run_output_dir, "config.yaml"), "w") as f:
+            f.write(cfg_yaml)
 
     # Set random seeds
     pl.seed_everything(cfg["training"]["train_seed"])
@@ -132,6 +137,8 @@ def run_tx_train(cfg: DictConfig):
     print("batch size:", dl.batch_size)
 
     var_dims = data_module.get_var_dims()  # {"gene_dim": …, "hvg_dim": …}
+    if data_module.cell_type_onehot_map:
+        var_dims["cell_type_dim"] = next(iter(data_module.cell_type_onehot_map.values())).shape[0]
     if output_space == "gene":
         gene_dim = var_dims.get("hvg_dim", 2000)  # fallback if key missing
     else:
@@ -154,17 +161,18 @@ def run_tx_train(cfg: DictConfig):
         cfg["model"]["kwargs"].pop("decoder_cfg", None)
         cfg["model"]["kwargs"]["gene_decoder_bool"] = False
 
-    # Save one-hot maps as artifacts instead of storing them in config
+    # Save one-hot maps as artifacts instead of storing them in config (rank 0 only)
     cell_type_onehot_map_path = join(run_output_dir, "cell_type_onehot_map.torch")
     pert_onehot_map_path = join(run_output_dir, "pert_onehot_map.pt")
     batch_onehot_map_path = join(run_output_dir, "batch_onehot_map.torch")
     var_dims_path = join(run_output_dir, "var_dims.pkl")
 
-    torch.save(data_module.cell_type_onehot_map, cell_type_onehot_map_path)
-    torch.save(data_module.pert_onehot_map, pert_onehot_map_path)
-    torch.save(data_module.batch_onehot_map, batch_onehot_map_path)
-    with open(var_dims_path, "wb") as f:
-        pickle.dump(var_dims, f)
+    if local_rank == 0:
+        torch.save(data_module.cell_type_onehot_map, cell_type_onehot_map_path)
+        torch.save(data_module.pert_onehot_map, pert_onehot_map_path)
+        torch.save(data_module.batch_onehot_map, batch_onehot_map_path)
+        with open(var_dims_path, "wb") as f:
+            pickle.dump(var_dims, f)
 
     if cfg["model"]["name"].lower() in ["cpa", "scvi"] or cfg["model"]["name"].lower().startswith("scgpt"):
         cfg["model"]["kwargs"]["n_cell_types"] = len(data_module.celltype_onehot_map)
@@ -177,7 +185,7 @@ def run_tx_train(cfg: DictConfig):
         cfg["data"]["kwargs"],
         cfg["model"]["kwargs"],
         cfg["training"],
-        data_module.get_var_dims(),
+        var_dims,
     )
 
     print(
@@ -275,7 +283,7 @@ def run_tx_train(cfg: DictConfig):
         logger=loggers,
         plugins=plugins,
         callbacks=callbacks,
-        gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() != "cpa" else None,
+        gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() not in ("cpa", "reptile") else None,
         accumulate_grad_batches=cfg["training"].get("gradient_accumulation_steps", 1),
         use_distributed_sampler=False,
     )
@@ -368,6 +376,25 @@ def run_tx_train(cfg: DictConfig):
                 )
             else:
                 print("WARNING: pert_encoder will not be rebuilt since input dimension matches")
+
+        # Rebuild cell_type_encoder if cell_type_dim changed or cell_type_encoder is newly enabled
+        if model.cell_type_encoder is not None:
+            checkpoint_ct_key = "cell_type_encoder.weight"
+            if checkpoint_ct_key in checkpoint_state:
+                checkpoint_ct_dim = checkpoint_state[checkpoint_ct_key].shape[0]
+                if checkpoint_ct_dim != model.cell_type_dim:
+                    print(
+                        f"cell_type_encoder vocab mismatch: model.cell_type_dim={model.cell_type_dim} "
+                        f"but checkpoint has {checkpoint_ct_dim}. Reinitializing cell_type_encoder."
+                    )
+                    model.cell_type_encoder = torch.nn.Embedding(
+                        num_embeddings=model.cell_type_dim,
+                        embedding_dim=model.hidden_dim,
+                    )
+                else:
+                    print("WARNING: cell_type_encoder will not be reinitialized since vocab size matches checkpoint")
+            else:
+                print("cell_type_encoder not found in checkpoint — starting from random init.")
 
         # Filter out mismatched size parameters
         filtered_state = {}

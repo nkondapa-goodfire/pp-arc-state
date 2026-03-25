@@ -123,6 +123,7 @@ class ReptilePerturbationModel(PerturbationModel):
         no_sync = ddp_model.no_sync if hasattr(ddp_model, "no_sync") else nullcontext
 
         inner_losses: List[torch.Tensor] = []
+        inner_grad_norms: List[torch.Tensor] = []
         for mini_batch in task_batch:
             loss = self.compute_inner_loss(mini_batch)
             inner_losses.append(loss.detach())
@@ -130,6 +131,11 @@ class ReptilePerturbationModel(PerturbationModel):
             inner_opt.zero_grad()
             with no_sync():
                 self.manual_backward(loss)
+            inner_grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in self.parameters() if p.requires_grad],
+                max_norm=self._grad_clip,
+            )
+            inner_grad_norms.append(inner_grad_norm.detach())
             inner_opt.step()
 
         # 4. Reptile gradient: θ_t − θ̃ ---------------------------------
@@ -162,7 +168,7 @@ class ReptilePerturbationModel(PerturbationModel):
             if param.requires_grad:
                 param.grad = reptile_grads[name]
 
-        grad_norm = nn.utils.clip_grad_norm_(
+        outer_grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in self.parameters() if p.requires_grad],
             max_norm=self._grad_clip,
         )
@@ -170,8 +176,20 @@ class ReptilePerturbationModel(PerturbationModel):
 
         # 8. Logging ----------------------------------------------------
         self.log("train/inner_loss_mean", torch.stack(inner_losses).mean(), prog_bar=True)
-        self.log("train/reptile_grad_norm", grad_norm)
+        self.log("train/inner_grad_norm", torch.stack(inner_grad_norms).mean())
+        self.log("train/outer_grad_norm", outer_grad_norm.detach())
         self.log("train/k_inner", float(k))
+
+    # ------------------------------------------------------------------
+    # Device transfer — batch is List[Dict], not Dict
+    # ------------------------------------------------------------------
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        return [
+            {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+             for k, v in mb.items()}
+            for mb in batch
+        ]
 
     # ------------------------------------------------------------------
     # Outer optimizer — moments accumulate across tasks
