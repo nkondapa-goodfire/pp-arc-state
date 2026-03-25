@@ -30,6 +30,7 @@ dependencies = [
     "cell-eval>=0.6.8",
     "ipykernel>=6.30.1",
     "scipy>=1.15.0",
+    "pdex==0.1.28",
 ]
 
 [project.optional-dependencies]
@@ -53,3 +54,4 @@ venv = ".venv"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/state"]
+

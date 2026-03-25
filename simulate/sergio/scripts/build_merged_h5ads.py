@@ -72,8 +72,12 @@ def merge_group(
     key: tuple,
     paths: list[pathlib.Path],
     src: pathlib.Path,
+    bins: list[str] | None = None,
 ) -> anndata.AnnData:
-    """Load and concatenate all instances for one condition, adding provenance columns."""
+    """Load and concatenate all instances for one condition, adding provenance columns.
+
+    If bins is provided, only cells whose gem_group is in bins are retained.
+    """
     grn_type, size_val, noise_val, pert_type = key
     adatas = []
     for p in paths:
@@ -82,6 +86,8 @@ def merge_group(
         grn_seed = int(grn_dir.replace("grn_", ""))
 
         ad = anndata.read_h5ad(p)
+        if bins is not None:
+            ad = ad[ad.obs["gem_group"].isin(bins)].copy()
         ad.obs["grn_type"]    = grn_type
         ad.obs["grn_size"]    = int(size_val)
         ad.obs["noise_label"] = noise_val
@@ -90,6 +96,7 @@ def merge_group(
 
     merged = anndata.concat(adatas, join="outer")
     merged.obs_names_make_unique()
+    merged.obsm["X_hvg"] = merged.X.toarray()
     return merged
 
 
@@ -97,12 +104,14 @@ def condition_filename(grn_type: str, size_val: str, noise_val: str, pert_type: 
     return f"{grn_type}_size{size_val}_noise{noise_val}_{pert_type}.h5ad"
 
 
-def build_merged_h5ads(src: pathlib.Path, dst: pathlib.Path) -> pd.DataFrame:
+def build_merged_h5ads(src: pathlib.Path, dst: pathlib.Path, bins: list[str] | None = None) -> pd.DataFrame:
     dst.mkdir(parents=True, exist_ok=True)
 
     groups = collect_paths(src)
     n_source = sum(len(v) for v in groups.values())
     print(f"Found {len(groups)} conditions across {n_source} source files.")
+    if bins is not None:
+        print(f"Filtering to bins: {bins}")
 
     manifest_rows = []
     created = skipped = 0
@@ -119,7 +128,7 @@ def build_merged_h5ads(src: pathlib.Path, dst: pathlib.Path) -> pd.DataFrame:
             n_instances = ad.obs["grn_seed"].nunique() if "grn_seed" in ad.obs else len(paths)
             ad.file.close()
         else:
-            merged = merge_group(key, paths, src)
+            merged = merge_group(key, paths, src, bins=bins)
             merged.write_h5ad(out_path)
             n_cells = merged.n_obs
             n_instances = len(paths)
@@ -150,6 +159,11 @@ def main():
     )
     parser.add_argument("--src", required=True, help="Source dataset directory (nested).")
     parser.add_argument("--dst", required=True, help="Destination merged H5AD directory.")
+    parser.add_argument(
+        "--bins", default=None,
+        help="Comma-separated bin labels to retain (e.g. bin_0,bin_1,bin_2,bin_3,bin_4). "
+             "Filters on obs['gem_group']. If omitted, all bins are kept.",
+    )
     args = parser.parse_args()
 
     src = pathlib.Path(args.src).resolve()
@@ -158,9 +172,11 @@ def main():
     if not src.exists():
         raise FileNotFoundError(f"Source directory not found: {src}")
 
+    bins = [b.strip() for b in args.bins.split(",")] if args.bins else None
+
     print(f"Source: {src}")
     print(f"Dest:   {dst}")
-    build_merged_h5ads(src, dst)
+    build_merged_h5ads(src, dst, bins=bins)
 
 
 if __name__ == "__main__":

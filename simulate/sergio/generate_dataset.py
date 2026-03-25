@@ -186,18 +186,15 @@ def build_anndata(
     X = np.vstack([X_ctrl, X_pert])
 
     # obs metadata
-    cell_type_ctrl = [f"bin_{b}" for b in range(n_bins) for _ in range(n_sc)]
-    cell_type_pert = cell_type_ctrl[:]
-    gene_ctrl = ["non-targeting"] * n_cells_per_cond
-    gene_pert = [f"SYN_{global_gene_idx:04d}_{pert_label}"] * n_cells_per_cond
-    out_deg_ctrl = [-1] * n_cells_per_cond
-    out_deg_pert = [ko_out_degree] * n_cells_per_cond
+    # cell_type = GRN seed (the "cell line" analog — distinct regulatory topology)
+    # gem_group = bin    (minor variation of the same GRN via different master-regulator rates)
+    bin_labels = [f"bin_{b}" for b in range(n_bins) for _ in range(n_sc)]
 
     obs = {
-        "gene":          gene_ctrl + gene_pert,
-        "cell_type":     cell_type_ctrl + cell_type_pert,
-        "gem_group":     [f"grn_{grn_seed:04d}"] * (2 * n_cells_per_cond),
-        "ko_out_degree": out_deg_ctrl + out_deg_pert,
+        "gene":          ["non-targeting"] * n_cells_per_cond + [f"SYN_{global_gene_idx:04d}_{pert_label}"] * n_cells_per_cond,
+        "cell_type":     [f"{grn_type}_size{grn_size:03d}_seed{grn_seed:04d}"] * (2 * n_cells_per_cond),
+        "gem_group":     bin_labels + bin_labels,
+        "ko_out_degree": [-1] * n_cells_per_cond + [ko_out_degree] * n_cells_per_cond,
         "pert_strength": [0.0] * n_cells_per_cond + [pert_strength] * n_cells_per_cond,
     }
 

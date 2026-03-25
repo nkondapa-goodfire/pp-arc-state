@@ -1,0 +1,10 @@
+[datasets]
+replogle_nadig = "/mnt/polished-lake/artifacts/public/arc/data/Replogle-Nadig-Preprint/replogle_matched_hvg.h5ad"
+
+[training]
+replogle_nadig = "train"
+
+[zeroshot]
+"replogle_nadig.k562" = "test"
+
+[fewshot]

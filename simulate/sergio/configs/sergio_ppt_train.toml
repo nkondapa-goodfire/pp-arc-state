@@ -1,0 +1,7 @@
+[datasets]
+sergio_ppt = "/mnt/polished-lake/home/nkondapaneni/state/simulate/sergio/data/sergio_synthetic/SERGIO_PPT_merged"
+
+[training]
+sergio_ppt = "train"
+
+[zeroshot]

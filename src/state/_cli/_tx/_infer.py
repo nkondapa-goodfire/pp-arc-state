@@ -437,7 +437,16 @@ def run_tx_infer(args: argparse.Namespace):
         if not args.quiet:
             print(f"No --checkpoint given, using {checkpoint_path}")
 
-    model = StateTransitionPerturbationModel.load_from_checkpoint(checkpoint_path)
+    import torch
+    _orig_load = torch.load
+    def _patched_load(*args, **kwargs):
+        kwargs['weights_only'] = False
+        return _orig_load(*args, **kwargs)
+    torch.load = _patched_load
+    try:
+        model = StateTransitionPerturbationModel.load_from_checkpoint(checkpoint_path)
+    finally:
+        torch.load = _orig_load
     model.eval()
     device = next(model.parameters()).device
     cell_set_len = args.max_set_len if args.max_set_len is not None else getattr(model, "cell_sentence_len", 256)
